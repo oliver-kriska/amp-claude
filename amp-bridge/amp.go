@@ -68,6 +68,12 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 		return "", errEmptyText
 	}
 
+	// Remember an explicitly addressed thread, so pairing works from either
+	// side: Amp binds the pair with `--ask --thread`, and Claude binds it by
+	// naming the thread once. Without this, only the Amp side could establish
+	// the pair and Claude had to repeat the id on every call.
+	b.rememberThread(threadID)
+
 	// One Amp turn at a time: concurrent `threads continue` runs against the
 	// same thread would interleave writes into one conversation.
 	b.askMu.Lock()

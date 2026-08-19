@@ -1,5 +1,3 @@
-# Built binary and its runtime log — both regenerate, and the log can contain
+# The runtime log lives here only if AMP_BRIDGE_LOG points at it; it can contain
 # conversation text when AMP_BRIDGE_LOG_BODIES=1.
-amp-bridge
 *.log
-coverage.out

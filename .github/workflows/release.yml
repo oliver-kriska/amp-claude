@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          version: 2026.8.1
+
+      # Cross-compiling needs no cgo here: the module has no dependencies and
+      # the bridge uses only the standard library.
+      - name: Build every target
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            out="dist/amp-bridge_${os}_${arch}"
+            GOOS="$os" GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.serverVersion=${version}" \
+              -o "$out/amp-bridge" ./amp-bridge
+            cp README.md LICENSE "$out/"
+            tar -czf "dist/amp-bridge_${version}_${os}_${arch}.tar.gz" -C "$out" .
+            rm -rf "$out"
+          done
+          cd dist && sha256sum *.tar.gz > checksums.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*.tar.gz dist/checksums.txt

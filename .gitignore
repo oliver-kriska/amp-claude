@@ -6,3 +6,8 @@
 # absolute path to the installed binary, so a committed copy is broken for
 # everyone else and drifts silently for you. See amp-bridge/init.go.
 .mcp.json
+
+# Build output. `make build` writes bin/amp-bridge; the source package is
+# amp-bridge/, so the binary cannot share that name.
+/bin/
+/coverage.out

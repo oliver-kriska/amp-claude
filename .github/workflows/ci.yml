@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain is pinned in .tool-versions; installing it the same way
+      # locally and in CI is the point of pinning it at all.
+      - uses: jdx/mise-action@v2
+        with:
+          version: 2026.8.1
+
+      # tidy, skill drift, formatting, go vet on both build tags, 29 linters,
+      # and both test tiers under -race. Same command a contributor runs.
+      - run: make check

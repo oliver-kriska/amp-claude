@@ -1,4 +1,4 @@
-module amp-bridge
+module github.com/oliver-kriska/amp-claude
 
 // No dependencies, and that is deliberate — do not add an MCP SDK.
 //
@@ -9,5 +9,5 @@ module amp-bridge
 // transport here is hand-rolled for that reason. See
 // .claude/research/2026-08-19-amp-claude-code-bridge.md §10.
 //
-// The toolchain is pinned in ../.tool-versions (mise).
+// The toolchain is pinned in .tool-versions (mise).
 go 1.26.6

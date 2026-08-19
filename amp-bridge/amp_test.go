@@ -32,7 +32,11 @@ func ampHarness(t *testing.T, script string) *harness {
 	return newHarness(t, func(c *config) {
 		c.ampDisabled = false
 		c.ampBin = bin
-		c.ampTimeout = 5 * time.Second
+		// Generous on purpose. macOS pays a first-exec security check on each
+		// freshly written script, which can take seconds under parallel load;
+		// a tight budget here makes every test that shells out flaky. The tests
+		// that actually exercise the timeout set their own short one.
+		c.ampTimeout = 60 * time.Second
 	})
 }
 
@@ -221,5 +225,42 @@ func TestAmpDiagnosisReadsTheTailOfABigLog(t *testing.T) {
 	noise := strings.Repeat(`{"level":"INFO","message":"chatter"}`+"\n", 20000)
 	if got := ampDiagnosis(writeLog(t, noise+executorBusyLog)); !strings.Contains(got, "pid 50778") {
 		t.Errorf("lost the error behind %d bytes of noise: %q", len(noise), got)
+	}
+}
+
+func TestAskAmpRemembersAThreadClaudeNamed(t *testing.T) {
+	t.Parallel()
+	h := ampHarness(t, `echo "$3"`)
+
+	// Pairing has to work from either end. Amp binds it with `--ask --thread`;
+	// Claude binds it by naming the thread once, and should not have to repeat
+	// the id on every later call.
+	if _, err := h.b.askAmp("T-claude-chose", "hello"); err != nil {
+		t.Fatalf("askAmp: %v", err)
+	}
+	if got := h.b.knownThread(); got != "T-claude-chose" {
+		t.Errorf("knownThread = %q, want the thread ask_amp just used", got)
+	}
+
+	out, err := h.b.askAmp("", "follow-up")
+	if err != nil {
+		t.Fatalf("follow-up: %v", err)
+	}
+	if strings.TrimSpace(out) != "T-claude-chose" {
+		t.Errorf("follow-up went to %q, want the remembered thread", strings.TrimSpace(out))
+	}
+}
+
+func TestAskAmpDoesNotRememberARejectedThread(t *testing.T) {
+	t.Parallel()
+	h := ampHarness(t, `echo "$3"`)
+
+	// A thread id that fails validation must not become the default target —
+	// that would turn one bad call into every later call failing.
+	if _, err := h.b.askAmp("-not-an-id", "hi"); err == nil {
+		t.Fatal("an implausible thread id must be rejected")
+	}
+	if got := h.b.knownThread(); got != "" {
+		t.Errorf("remembered a rejected id: %q", got)
 	}
 }

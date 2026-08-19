@@ -83,7 +83,11 @@ func (h *harness) frames(t *testing.T) []map[string]any {
 // the time handle() returns.
 func (h *harness) response(t *testing.T, id any) map[string]any {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// Generous: some tests wait on a subprocess, and macOS runs a security check
+	// the first time it executes a freshly written script — seconds, under
+	// parallel load. A deadline tuned to the fast path makes those tests flaky
+	// in a way that looks like a transport bug.
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		for _, f := range h.frames(t) {
 			if got := f["id"]; got != nil && equalJSON(got, id) {

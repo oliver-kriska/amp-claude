@@ -21,9 +21,18 @@ import (
 // the experimental capability key (see handleInitialize), and `meta` rather
 // than `_meta` (see pushEvent).
 
+const serverName = "amp-bridge"
+
+// serverVersion is overridden at build time:
+//
+//	go build -ldflags "-X main.serverVersion=v1.2.3"
+//
+// so a release binary reports the tag it was cut from rather than whatever the
+// source last said. `go install` produces a binary that says "dev", which is
+// accurate: it was built from a module version, not from a release.
+var serverVersion = "dev"
+
 const (
-	serverName    = "amp-bridge"
-	serverVersion = "0.3.0"
 
 	// legacyProtocol is what Claude Code offers on the fallback `initialize`
 	// handshake. Used only when the client names no version at all.

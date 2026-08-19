@@ -115,15 +115,18 @@ registry.
 ## Building and testing
 
 Toolchain is pinned in `.tool-versions` (mise): Go 1.26.6 and
-golangci-lint 2.12.2. Run `mise install` once at the repo root; `make tools`
+golangci-lint 2.12.2. Run `mise install` once; `make tools`
 reports the active versions and warns if they have drifted from the pins.
 
 ```bash
-mise install           # once, at the repo root
-cd amp-bridge
-make setup             # build + install to ~/.local/bin + register in ../.mcp.json
-make check             # tidy, format, vet, lint, and both test tiers — the gate
+mise install           # once — pins Go and golangci-lint from .tool-versions
+make setup             # build + install to ~/.local/bin + register in ./.mcp.json
+make check             # tidy, skill drift, format, vet, lint, both test tiers — the gate
 ```
+
+The Makefile and `go.mod` live at the repo root; the Go sources are in
+`amp-bridge/` and build to `bin/amp-bridge`. Run every `make` target from the
+root.
 
 `make setup` is build, install and `amp-bridge init` in one step; the pieces are
 still available separately as `make build` / `make install` / `make doctor`.
@@ -139,8 +142,8 @@ always be empty. An MCP SDK would implement `server/discover`, which wins the
 modern handshake negotiation and silently kills channel delivery — the reason
 the transport is hand-rolled. `go.mod` carries this warning too.
 
-`make install` is what the running channel uses: `.mcp.json` points at the
-installed binary, not the one in this tree. Building alone changes nothing a
+`make install` is what the running channel uses: the MCP config points at the
+installed binary, not the one in `bin/`. Building alone changes nothing a
 live session sees — install, then restart the Claude session.
 
 Individually: `make test` (unit, race detector on), `make test-integration`

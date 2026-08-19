@@ -248,6 +248,12 @@ func checkMCPShape(entry mcpEntry, dir string) check {
 	return check{"mcp config", statusOK, "", ""}
 }
 
+// mcpProbeTimeout bounds the --help probe. Generous on purpose: macOS runs a
+// security check the first time a freshly installed binary is executed, which
+// can take seconds on a loaded machine, and reporting a healthy binary as hung
+// would be its own false alarm. Overridden in tests.
+var mcpProbeTimeout = 20 * time.Second
+
 // checkMCPTarget runs the configured binary. Everything above this point can
 // pass while the file is unrunnable — a Mach-O whose signature `cp` invalidated
 // is a regular, executable file that the kernel SIGKILLs at exec. That failure
@@ -257,7 +263,7 @@ func checkMCPShape(entry mcpEntry, dir string) check {
 // Executing is proportionate here: this is the binary Claude already launches
 // unattended, and `--help` is its most inert entry point.
 func checkMCPTarget(command, self string) check {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), mcpProbeTimeout)
 	defer cancel()
 
 	// #nosec G204 -- the path comes from the project's own .mcp.json, which is
@@ -273,7 +279,8 @@ func checkMCPTarget(command, self string) check {
 	switch {
 	case ctx.Err() != nil:
 		return check{
-			"mcp config", statusFail, command + " did not respond to --help within 5s",
+			"mcp config", statusFail,
+			fmt.Sprintf("%s did not respond to --help within %s", command, mcpProbeTimeout),
 			"it may be hanging on startup; run it by hand",
 		}
 	case err != nil:

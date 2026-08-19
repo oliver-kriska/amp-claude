@@ -52,12 +52,14 @@ type options struct {
 	text    string
 	dir     string
 	strict  bool
+	global  bool
 }
 
 const usage = `amp-bridge — bridge an Amp thread to a Claude Code session
 
   amp-bridge                            run as an MCP stdio server (Claude spawns this)
   amp-bridge init [dir]                 write .mcp.json pointing at this binary
+  amp-bridge init --global              register for every project, plus the skill
   amp-bridge doctor [dir] [--strict]    diagnose why the channel is not working
   amp-bridge --list                     list live bridges
   amp-bridge [--session N] [--thread T] --ask "text"
@@ -132,11 +134,14 @@ func parseSubcommand(args []string) (options, bool) {
 		return options{}, false
 	}
 	for _, a := range args[1:] {
-		if a == "--strict" {
+		switch a {
+		case "--strict":
 			o.strict = true
-			continue
+		case "--global":
+			o.global = true
+		default:
+			o.dir = a
 		}
-		o.dir = a
 	}
 	return o, true
 }
@@ -149,6 +154,8 @@ func subcommandError(args []string) error {
 	for _, a := range args[1:] {
 		switch {
 		case a == "--strict" && args[0] == "doctor":
+			continue
+		case a == "--global" && args[0] == "init":
 			continue
 		case strings.HasPrefix(a, "-"):
 			return fmt.Errorf("%s does not take %s", args[0], a)
@@ -183,6 +190,9 @@ func run(args []string) int {
 	case modeAsk:
 		return cmdAsk(cfg, opts.session, opts.thread, opts.text)
 	case modeInit:
+		if opts.global {
+			return cmdInitGlobal()
+		}
 		return cmdInit(opts.dir)
 	case modeDoctor:
 		return cmdDoctor(cfg, opts.dir, opts.strict)

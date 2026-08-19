@@ -2,7 +2,16 @@
 # binary to a live session) should run.
 
 BIN := amp-bridge
+PKG := ./amp-bridge
+# Build output cannot be ./amp-bridge — that is the source directory. Everything
+# built lands in bin/, which is gitignored.
+OUT := bin/$(BIN)
 GO  ?= go
+
+# Stamped into the binary so `--help` and the MCP handshake report the release
+# they were cut from. Defaults to the git description; `dev` outside a checkout.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -ldflags "-X main.serverVersion=$(VERSION)"
 
 # Install location. ~/.local/bin is on PATH and, unlike $(go env GOBIN), is not
 # pinned to a toolchain version — mise puts GOBIN inside installs/go/<version>/,
@@ -18,15 +27,16 @@ help: ## List targets
 		awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
-build: ## Rebuild the binary
+build: ## Rebuild the binary into bin/
+	@mkdir -p bin
 	# rm first: overwriting a Mach-O in place invalidates its macOS signature,
 	# and the kernel then SIGKILLs it (exit 137) on every later exec.
-	rm -f $(BIN)
-	$(GO) build -trimpath -o $(BIN) .
+	rm -f $(OUT)
+	$(GO) build -trimpath $(LDFLAGS) -o $(OUT) $(PKG)
 	# Smoke test. A signature-invalidated binary dies with exit 137 here rather
 	# than silently failing later, where Claude reports only "server not found".
-	@./$(BIN) --help >/dev/null || { echo "built binary will not execute"; exit 1; }
-	@echo "built ./$(BIN)"
+	@./$(OUT) --help >/dev/null || { echo "built binary will not execute"; exit 1; }
+	@echo "built ./$(OUT)"
 
 .PHONY: install
 install: build ## Install to $(BINDIR) (override with PREFIX=/usr/local)
@@ -34,18 +44,18 @@ install: build ## Install to $(BINDIR) (override with PREFIX=/usr/local)
 	# Same signature trap as above: install(1) may overwrite in place, so unlink
 	# the old binary first and let the copy land on a fresh inode.
 	rm -f $(BINDIR)/$(BIN)
-	install -m 0755 $(BIN) $(BINDIR)/$(BIN)
+	install -m 0755 $(OUT) $(BINDIR)/$(BIN)
 	@$(BINDIR)/$(BIN) --help >/dev/null || { echo "installed binary will not execute"; exit 1; }
 	@echo "installed $(BINDIR)/$(BIN)"
 	@command -v $(BIN) >/dev/null 2>&1 || \
 		echo "note: $(BINDIR) is not on your PATH — add it to use \`$(BIN)\` bare"
 
-# The directory whose .mcp.json gets the bridge. Defaults to the repo root, one
-# level up from this Makefile; point it at any project you want a bridge in:
+# The directory whose .mcp.json gets the bridge. Defaults to this repo; point it
+# at any project you want a bridge in:
 #   make setup PROJECT=$$HOME/Projects/other-app
 # Quoted at every use site, so a path with spaces works — but note that `~` is
 # expanded by the shell, not by make, so spell out $$HOME rather than using ~.
-PROJECT ?= $(CURDIR)/..
+PROJECT ?= $(CURDIR)
 
 .PHONY: setup
 setup: install ## Build, install, and register the bridge in $(PROJECT)/.mcp.json
@@ -53,15 +63,20 @@ setup: install ## Build, install, and register the bridge in $(PROJECT)/.mcp.jso
 
 # Register for EVERY project instead of one: a user-scope MCP entry plus the
 # skill that teaches Claude how to use the bridge. Needs the `claude` CLI.
+# The skill is embedded in the binary so `go install` users get it too. This is
+# the copy that gets embedded; the canonical one is the repo's own skill.
+.PHONY: skill
+skill: ## Sync the embedded skill from .claude/skills/
+	cp .claude/skills/$(BIN)/SKILL.md amp-bridge/skill.md
+
+.PHONY: skill-check
+skill-check: ## Fail if the embedded skill has drifted
+	@diff -q .claude/skills/$(BIN)/SKILL.md amp-bridge/skill.md >/dev/null || \
+		{ echo "amp-bridge/skill.md is stale: run 'make skill'"; exit 1; }
+
 .PHONY: setup-global
 setup-global: install ## Register the bridge and skill for all projects
-	@command -v claude >/dev/null || { echo "the claude CLI is not on PATH"; exit 1; }
-	claude mcp add $(BIN) --scope user -- "$(BINDIR)/$(BIN)"
-	mkdir -p "$(HOME)/.claude/skills/$(BIN)"
-	cp ../.claude/skills/$(BIN)/SKILL.md "$(HOME)/.claude/skills/$(BIN)/SKILL.md"
-	@echo
-	@echo "registered for all projects. Start any session with:"
-	@echo "  claude --dangerously-load-development-channels server:$(BIN)"
+	@"$(BINDIR)/$(BIN)" init --global
 
 .PHONY: doctor
 doctor: ## Diagnose the installed bridge against $(PROJECT)
@@ -108,25 +123,25 @@ tidy: ## Verify go.mod is tidy
 	$(GO) mod tidy -diff
 
 .PHONY: check
-check: tidy fmt-check vet lint test test-integration ## Everything above
+check: tidy skill-check fmt-check vet lint test test-integration ## Everything above
 	@echo "all checks passed"
 
 .PHONY: tools
-tools: ## Report tool versions and flag drift from ../.tool-versions
+tools: ## Report tool versions and flag drift from .tool-versions
 	@command -v golangci-lint >/dev/null || \
-		{ echo "golangci-lint missing: run 'mise install' from the repo root"; exit 1; }
+		{ echo "golangci-lint missing: run 'mise install'"; exit 1; }
 	@$(GO) version
 	@golangci-lint --version | head -1
 	@command -v mise >/dev/null 2>&1 || exit 0; \
 	want=$$(mise current go 2>/dev/null); \
 	have=$$($(GO) env GOVERSION 2>/dev/null | sed 's/^go//'); \
 	if [ -n "$$want" ] && [ "$$want" != "$$have" ]; then \
-		echo "warning: go $$have in use, ../.tool-versions pins $$want (run 'mise install')"; \
+		echo "warning: go $$have in use, .tool-versions pins $$want (run 'mise install')"; \
 	fi; \
 	wantl=$$(mise current golangci-lint 2>/dev/null); \
 	havel=$$(golangci-lint --version 2>/dev/null | sed -n 's/.*version \([0-9.]*\) .*/\1/p'); \
 	if [ -n "$$wantl" ] && [ "$$wantl" != "$$havel" ]; then \
-		echo "warning: golangci-lint $$havel in use, ../.tool-versions pins $$wantl"; \
+		echo "warning: golangci-lint $$havel in use, .tool-versions pins $$wantl"; \
 	fi
 
 .PHONY: outdated
@@ -135,4 +150,4 @@ outdated: ## List dependency updates (there are none by design — see go.mod)
 
 .PHONY: clean
 clean: ## Remove build and coverage artefacts
-	rm -f $(BIN) coverage.out
+	rm -rf bin coverage.out

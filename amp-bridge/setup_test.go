@@ -229,7 +229,7 @@ func TestCheckMCPConfigRejectsANonExecutable(t *testing.T) {
 }
 
 func TestCheckMCPTargetRunsTheBinary(t *testing.T) {
-	t.Parallel()
+	// Not parallel: the subtest below adjusts the shared probe timeout.
 
 	// A regular, executable file that the OS kills at exec is indistinguishable
 	// from a healthy one until you run it — that is the invalidated-signature
@@ -248,18 +248,27 @@ func TestCheckMCPTargetRunsTheBinary(t *testing.T) {
 		t.Errorf("a binary that exits non-zero must FAIL, got %s", got.status.symbol())
 	}
 
+	fine := script(t, "exit 0")
+	if got := checkMCPTarget(fine, fine); got.status != statusOK {
+		t.Errorf("a healthy binary should pass, got %s %q", got.status.symbol(), got.detail)
+	}
+
+	// Last, because it shortens the shared probe timeout: a binary that never
+	// returns must be bounded rather than hanging doctor. Shortened so the test
+	// need not wait the real bound out; what is under test is that the bound
+	// holds at all, and that a grandchild holding the output pipe cannot
+	// extend it past it.
+	restore := mcpProbeTimeout
+	mcpProbeTimeout = 2 * time.Second
+	defer func() { mcpProbeTimeout = restore }()
+
 	hangs := script(t, "sleep 30")
 	start := time.Now()
 	if got := checkMCPTarget(hangs, hangs); got.status != statusFail {
 		t.Errorf("a hanging binary must FAIL, got %s", got.status.symbol())
 	}
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Errorf("waited %s for a hanging binary; the timeout did not bound it", elapsed)
-	}
-
-	fine := script(t, "exit 0")
-	if got := checkMCPTarget(fine, fine); got.status != statusOK {
-		t.Errorf("a healthy binary should pass, got %s %q", got.status.symbol(), got.detail)
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Errorf("waited %s for a `sleep 30` binary; the timeout did not bound it", elapsed)
 	}
 }
 
@@ -515,5 +524,65 @@ func TestCheckMCPConfigWarnsWithNoRegistrationAnywhere(t *testing.T) {
 		if !strings.Contains(got.fix, want) {
 			t.Errorf("fix should mention %q, got %q", want, got.fix)
 		}
+	}
+}
+
+func TestParseSubcommandFlags(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		args    []string
+		mode    runMode
+		dir     string
+		strict  bool
+		global  bool
+		wantErr bool
+	}{
+		{args: []string{"doctor"}, mode: modeDoctor, dir: "."},
+		{args: []string{"doctor", "--strict"}, mode: modeDoctor, dir: ".", strict: true},
+		{args: []string{"doctor", "/p", "--strict"}, mode: modeDoctor, dir: "/p", strict: true},
+		{args: []string{"init"}, mode: modeInit, dir: "."},
+		{args: []string{"init", "--global"}, mode: modeInit, dir: ".", global: true},
+		{args: []string{"init", "/p"}, mode: modeInit, dir: "/p"},
+		// A flag that belongs to the other subcommand is a typo, and a typo that
+		// silently does nothing is the failure mode this binary keeps designing
+		// against.
+		{args: []string{"init", "--strict"}, wantErr: true},
+		{args: []string{"doctor", "--global"}, wantErr: true},
+		{args: []string{"doctor", "--nope"}, wantErr: true},
+		{args: []string{"init", "/a", "/b"}, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			t.Parallel()
+			got, err := parseArgs(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want an error, got %+v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseArgs: %v", err)
+			}
+			if got.mode != tc.mode || got.dir != tc.dir ||
+				got.strict != tc.strict || got.global != tc.global {
+				t.Errorf("got mode=%v dir=%q strict=%v global=%v",
+					got.mode, got.dir, got.strict, got.global)
+			}
+		})
+	}
+}
+
+func TestEmbeddedSkillIsPresent(t *testing.T) {
+	t.Parallel()
+	// A `go install` user has no repository, so the skill has to travel inside
+	// the binary. An empty embed would make `init --global` silently install
+	// nothing.
+	if len(skillDoc) < 500 {
+		t.Errorf("embedded skill is %d bytes; it should be the real document", len(skillDoc))
+	}
+	if !strings.Contains(skillDoc, "request_id") {
+		t.Error("embedded skill does not look like the amp-bridge skill")
 	}
 }
