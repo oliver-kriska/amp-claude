@@ -1,6 +1,6 @@
 # Amp ↔ Claude Code bridge — research from the Claude Code side
 
-**Date:** 2026-08-19 (rev. 12)
+**Date:** 2026-08-19 (rev. 13)
 **Context:** Independent Claude-Code-side investigation of the cross-session messaging layer, decoded
 from the shipped binary and verified against live state. Rev. 2 incorporates the Amp-side finding that
 **Channels** — not synthetic peer registration — is the officially supported integration point, plus
@@ -1008,6 +1008,86 @@ self-knowledge, not about the cause. Find where it writes what it does know.
 
 ---
 
+## 19. Pairing, and the route around the executor limit (rev. 13)
+
+### Pairing is symmetric now
+
+The bridge had an asymmetry nobody had noticed because one side always spoke
+first: Amp could bind a pair with `--ask --thread T-x`, but Claude naming a
+thread in `ask_amp` did not remember it, so Claude had to repeat the id on every
+call and could never establish the pair itself. One line fixed it. A thread id
+that fails validation is deliberately *not* remembered — otherwise a single
+malformed call poisons every later one.
+
+So neither side needs the other's identifier up front:
+
+- Amp names its thread once; the id rides in the notification meta and appears as
+  `thread_id` on the `<channel>` tag.
+- Claude names the thread once in `ask_amp`; it becomes the session default.
+- `amp-bridge --list` supplies Claude session names, `amp threads list` supplies
+  Amp thread ids. With one of each, both are optional.
+
+### The preflight that would have saved an afternoon
+
+Asked what a *pair-level* check could have caught, the Amp side came back with a
+verified answer rather than a guess: `amp top --stream-jsonl` emits per-thread
+state including `executorConnected`, e.g.
+
+```json
+{"id":"T-01a01877-…","working":true,"executorConnected":true}
+```
+
+So `doctor --thread <id>` could stream that for a couple of seconds and report
+that `ask_amp` cannot attach — **without** attempting `threads continue`, which
+on an unattached thread would create a real turn as a side effect of a diagnostic.
+Caveats worth keeping if this gets built: the JSON schema is marked EXPERIMENTAL,
+`executorConnected: true` is the definitive signal while `false` can race with a
+session opening a moment later, and it should fail open ("could not inspect")
+rather than fail closed when the schema drifts.
+
+Not built yet. The design point it settles is that the check belongs to the
+*pair*, not to either side, and neither side's existing checks could ever have
+found it: Claude's doctor cannot see Amp thread state, and Amp's CLI has no
+reason to ask about a Claude session.
+
+### The architectural route, not just the diagnostic
+
+The more interesting half: Amp exposes a plugin API (`amp plugins show-docs`)
+with `amp.activeThread.current`, `amp.threads.get(id).state.get()`, and
+`PluginThread.appendUserMessage(...)`. A plugin loaded *inside* the existing
+executor could own a local inbox and append Claude's messages into the
+already-open thread — no second executor, so the constraint in §18 disappears
+rather than being reported.
+
+That is the route to genuinely symmetric unsolicited Claude→Amp messaging.
+`amp threads continue --execute` stays the fallback for quiescent threads. Both
+sides independently reached the same conclusion here, which is the first time
+that has happened in this project — every earlier agreement was one side
+correcting the other.
+
+### Published
+
+Restructured for distribution: root `go.mod` as
+`github.com/oliver-kriska/amp-claude` so `go install …/amp-bridge@latest`
+resolves and tags stay plain, MIT licence, CI on Linux and macOS, a release
+workflow building darwin/linux × amd64/arm64, and a checksum-verifying
+`install.sh`. `amp-bridge init --global` makes the binary self-sufficient for
+users who have no checkout: it registers the user-scope MCP entry through
+`claude mcp add` — never by editing `~/.claude.json`, which Claude Code owns and
+rewrites, and which is how the documented `--scope local` clobber happens — and
+installs a `go:embed`ed copy of the skill.
+
+Three test-quality fixes fell out of getting CI-ready, all one cause: macOS runs
+a security check the first time it executes a freshly written file, which takes
+*seconds* under parallel load. Deadlines tuned to the fast path were flaky in a
+way that reads as a transport bug. Worth remembering for any Go test suite that
+shells out to generated scripts. One of them, a shortened timeout leaking into a
+later assertion in the same function, passed at `-count=1` and failed only at
+`-count=2` — the third variation this project has produced on "the test was not
+testing what it claimed".
+
+---
+
 ## Open questions
 
 1. ~~Which protocol era must a channel server negotiate?~~ **Answered:** Claude proposes `2025-11-25`
@@ -1032,7 +1112,7 @@ filesystem state, the `SendMessage` tool contract, and `--help` output. Minified
 traced by hand. Claims resting on a single decompiled expression rather than observed behaviour are
 marked as such. No live-session messaging was performed.
 
-**Changelog.** Rev. 12: added §18 — the `ask_amp` failure was never a wedged thread; Amp permits one executor per thread and an open interactive session holds it, so the outbound direction cannot reach the very thread the bridge most wants; corrected the earlier misdiagnosis, documented the asymmetry, and made `askAmp` parse amp's own log so the real cause is reported. Rev. 11: added §17 — peer review received over the bridge itself; fixed six findings (unchecked `send` result, non-fatal registry publish, swallowed symlink refusal, the empty-`request_id` fallback removed outright, orphaned Amp subprocess on shutdown, `sockaddr_un` overflow); added `thread_id` routing in the notification meta, and `doctor`/`init`/`make setup` so the quiet failure modes announce themselves. Rev. 10: added §16 — external adversarial review; fixed six confirmed defects, the worst being that the socket watchdog watched a signal that can never fire (unlinking a Unix socket does not fail Accept) and its test simulated the wrong failure; corrected the §15 rationale accordingly. Rev. 9: added §15 — ported OTP supervision to the Go bridge after live testing of ask_amp; added panic containment (`guard`), listener supervision with rebind, and a bounded restart budget that escalates by exiting rather than retrying forever; declined the GenServer-for-state translation with reasoning. Rev. 8: added §14 — removed the superseded Python probe, the `AMP_BRIDGE_PROTOCOL` escape hatch (built on the wrong reading of the era trap) and other dead code; moved configuration out of package globals into a `config` struct so tests are hermetic; replaced the Python e2e harness with a two-tier Go suite (66 tests, `-race`, 77.7% coverage) after validating the refactor against the old harness; added `.golangci.yml` (29 linters) and a `make check` gate. Rev. 3: added §10 — built and ran an instrumented probe server; captured Claude's real
+**Changelog.** Rev. 13: added §19 — pairing made symmetric from either side; recorded the Amp-side finding that `amp top --stream-jsonl` exposes `executorConnected`, giving a read-only preflight for the §18 constraint, and the Amp plugin API as the route that removes the constraint rather than reporting it; restructured for publication (root module, MIT, CI, release workflow, checksum-verifying installer, self-sufficient `init --global`). Rev. 12: added §18 — the `ask_amp` failure was never a wedged thread; Amp permits one executor per thread and an open interactive session holds it, so the outbound direction cannot reach the very thread the bridge most wants; corrected the earlier misdiagnosis, documented the asymmetry, and made `askAmp` parse amp's own log so the real cause is reported. Rev. 11: added §17 — peer review received over the bridge itself; fixed six findings (unchecked `send` result, non-fatal registry publish, swallowed symlink refusal, the empty-`request_id` fallback removed outright, orphaned Amp subprocess on shutdown, `sockaddr_un` overflow); added `thread_id` routing in the notification meta, and `doctor`/`init`/`make setup` so the quiet failure modes announce themselves. Rev. 10: added §16 — external adversarial review; fixed six confirmed defects, the worst being that the socket watchdog watched a signal that can never fire (unlinking a Unix socket does not fail Accept) and its test simulated the wrong failure; corrected the §15 rationale accordingly. Rev. 9: added §15 — ported OTP supervision to the Go bridge after live testing of ask_amp; added panic containment (`guard`), listener supervision with rebind, and a bounded restart budget that escalates by exiting rather than retrying forever; declined the GenServer-for-state translation with reasoning. Rev. 8: added §14 — removed the superseded Python probe, the `AMP_BRIDGE_PROTOCOL` escape hatch (built on the wrong reading of the era trap) and other dead code; moved configuration out of package globals into a `config` struct so tests are hermetic; replaced the Python e2e harness with a two-tier Go suite (66 tests, `-race`, 77.7% coverage) after validating the refactor against the old harness; added `.golangci.yml` (29 linters) and a `make check` gate. Rev. 3: added §10 — built and ran an instrumented probe server; captured Claude's real
 MCP handshake (`2025-11-25`, modern era), confirmed the era trap and the `not-in-era` mechanism, pinned
 the channel payload fields, resolved account eligibility (policy-blocked on `claude_max`), and found
 the `--scope local` clobber. Rev. 2: added §6 Channels (missed in rev. 1 — caught by the Amp-side research);
