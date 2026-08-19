@@ -1,0 +1,102 @@
+# golangci-lint v2. Linter set and thresholds follow the house standard:
+# bugs / security / performance / style / modernization / testing.
+version: "2"
+
+run:
+  # The integration tier is behind a build tag; without this it is never linted.
+  build-tags:
+    - integration
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    # bugs
+    - govet
+    - staticcheck
+    - errcheck
+    - errorlint
+    - bodyclose
+    - noctx
+    - nilerr
+    - fatcontext
+    - contextcheck
+    - forcetypeassert
+    - makezero
+    # security
+    - gosec
+    # performance
+    - prealloc
+    - unconvert
+    - perfsprint
+    # style
+    - gocyclo
+    - gocognit
+    - funlen
+    - nestif
+    - ineffassign
+    - unused
+    - misspell
+    - revive
+    - gocritic
+    # modernization
+    - intrange
+    - usestdlibvars
+    - modernize
+    # testing
+    - thelper
+    - tparallel
+
+  settings:
+    errcheck:
+      # Catches `v, _ := x.(T)` dropping the ok value, not just ignored returns.
+      check-type-assertions: true
+    gocyclo:
+      min-complexity: 15
+    gocognit:
+      min-complexity: 30
+    funlen:
+      lines: 80
+      statements: 50
+    nestif:
+      min-complexity: 4
+    misspell:
+      # No locale: the protocol vocabulary (initialize, notifications/initialized)
+      # is US-spelled and not ours to rename, while the prose is British. Without
+      # a locale, misspell still catches genuine typos and accepts both.
+      ignore-rules:
+        - initialise
+    revive:
+      rules:
+        - name: exported
+          disabled: true # this is a main package; nothing is imported elsewhere
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Test helpers are allowed to be long and to shell out; the complexity
+      # budget exists to keep production paths reviewable.
+      - path: _test\.go
+        linters:
+          - funlen
+          - gocognit
+          - gocyclo
+          - gosec
+          - noctx
+          - nestif
+
+formatters:
+  enable:
+    - gci
+    - gofumpt
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(amp-bridge)
+    gofumpt:
+      extra-rules: true

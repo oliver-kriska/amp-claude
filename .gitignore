@@ -1,0 +1,3 @@
+# Claude Code machine-local state: MCP server approvals and per-user settings.
+# Deliberately not shared — it records what this machine has consented to run.
+.claude/settings.local.json

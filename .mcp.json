@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "amp-bridge": {
+      "type": "stdio",
+      "command": "/Users/oliverkriska/.local/bin/amp-bridge",
+      "args": [],
+      "env": {}
+    }
+  }
+}
