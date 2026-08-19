@@ -147,7 +147,11 @@ func (b *bridge) serveSocket(ln net.Listener) {
 // the full timeout.
 func (b *bridge) handleAmpConn(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
+	// One misbehaving caller must not take the channel down for the session.
+	b.guard("amp connection", func() { b.serveAmpConn(conn) })
+}
 
+func (b *bridge) serveAmpConn(conn net.Conn) {
 	var (
 		enc    = json.NewEncoder(conn)
 		encMu  sync.Mutex
@@ -191,7 +195,7 @@ func (b *bridge) handleAmpConn(conn net.Conn) {
 		wg.Add(1)
 		go func(id string, sink chan string) {
 			defer wg.Done()
-			b.awaitReply(id, sink, gone, respond)
+			b.guard("reply waiter "+id, func() { b.awaitReply(id, sink, gone, respond) })
 		}(id, sink)
 	}
 	wg.Wait()

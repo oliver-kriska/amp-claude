@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ const (
 const (
 	errMethodNotFound = -32601
 	errInvalidParams  = -32602
+	errInternal       = -32603
 )
 
 var instruction = "Events from " + serverName + " arrive as <channel source=\"" + serverName +
@@ -71,7 +73,54 @@ type bridge struct {
 
 	threadMu   sync.Mutex
 	lastThread string
+
+	// The listener is replaceable: the supervisor rebinds it if it dies.
+	lnMu sync.Mutex
+	ln   net.Listener
+
+	// downCh marks a deliberate shutdown, so the supervisor does not treat it
+	// as a fault worth restarting. fatalCh is the opposite: supervision has
+	// given up and the process should exit non-zero.
+	downOnce  sync.Once
+	downCh    chan struct{}
+	fatalOnce sync.Once
+	fatalCh   chan struct{}
+
+	// Supervision knobs. Defaults are set in newBridge; tests lower them so a
+	// budget can be exhausted in milliseconds rather than seconds.
+	restartMax     int
+	restartWindow  time.Duration
+	restartBackoff time.Duration
 }
+
+func (b *bridge) listener() net.Listener {
+	b.lnMu.Lock()
+	defer b.lnMu.Unlock()
+	return b.ln
+}
+
+func (b *bridge) setListener(ln net.Listener) {
+	b.lnMu.Lock()
+	b.ln = ln
+	b.lnMu.Unlock()
+}
+
+func (b *bridge) beginShutdown() { b.downOnce.Do(func() { close(b.downCh) }) }
+
+func (b *bridge) shuttingDown() bool {
+	select {
+	case <-b.downCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// escalate is the supervisor giving up: the fault is permanent, so surface it
+// rather than limping on as a bridge Amp cannot reach.
+func (b *bridge) escalate() { b.fatalOnce.Do(func() { close(b.fatalCh) }) }
+
+func (b *bridge) fatalSignal() <-chan struct{} { return b.fatalCh }
 
 func newBridge(cfg config, out, logw io.Writer) *bridge {
 	return &bridge{
@@ -79,6 +128,12 @@ func newBridge(cfg config, out, logw io.Writer) *bridge {
 		out:     bufio.NewWriter(out),
 		logw:    logw,
 		pending: make(map[string]chan string),
+		downCh:  make(chan struct{}),
+		fatalCh: make(chan struct{}),
+
+		restartMax:     5,
+		restartWindow:  time.Minute,
+		restartBackoff: 100 * time.Millisecond,
 	}
 }
 
@@ -142,7 +197,18 @@ func toolResult(text string, isErr bool) map[string]any {
 
 // ── dispatch ────────────────────────────────────────────────────────────────
 
+// handle dispatches one JSON-RPC message. A panic in any handler is contained
+// here: killing the process would take the channel down for the whole session
+// over one malformed request.
 func (b *bridge) handle(msg rpc) {
+	if panicked := b.guard("handler for "+msg.Method, func() { b.dispatch(msg) }); panicked {
+		if len(msg.ID) > 0 {
+			b.fail(msg.ID, errInternal, "internal error handling "+msg.Method)
+		}
+	}
+}
+
+func (b *bridge) dispatch(msg rpc) {
 	switch msg.Method {
 
 	// Deliberately unhandled. Claude Code negotiates in two phases: it probes

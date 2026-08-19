@@ -203,15 +203,22 @@ func runServer(cfg config) int {
 	b.logf("=== %s %s started name=%s pid=%d claude_pid=%d socket=%s bodies=%v ===",
 		serverName, serverVersion, name, os.Getpid(), entry.ClaudePID, sock, cfg.logBodies)
 
+	b.setListener(ln)
+
 	cleanup := sync.OnceFunc(func() {
-		_ = ln.Close()
+		// Mark the shutdown first, so the supervisor reads the listener closing
+		// as intent rather than as a fault to restart.
+		b.beginShutdown()
+		if l := b.listener(); l != nil {
+			_ = l.Close()
+		}
 		_ = os.Remove(sock)
 		if regPath != "" {
 			_ = os.Remove(regPath)
 		}
 	})
 	defer cleanup()
-	go b.serveSocket(ln)
+	go b.superviseSocket(sock)
 
 	// Without this, SIGTERM skips the deferred cleanup and leaves a stale socket
 	// and registry entry behind. `--list` sweeps them eventually, but the window
@@ -225,8 +232,22 @@ func runServer(cfg config) int {
 		os.Exit(0)
 	}()
 
-	b.serveStdio(os.Stdin)
-	return 0
+	// Two ways to finish: Claude closes stdin (normal), or socket supervision
+	// gives up (permanent fault — exit non-zero so it is not mistaken for one).
+	done := make(chan struct{})
+	go func() {
+		b.serveStdio(os.Stdin)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return 0
+	case <-b.fatalSignal():
+		fmt.Fprintln(os.Stderr,
+			"amp-bridge: socket supervision exhausted its restart budget; exiting")
+		return 1
+	}
 }
 
 // serveStdio reads newline-delimited JSON-RPC until the transport closes.

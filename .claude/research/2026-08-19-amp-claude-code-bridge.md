@@ -728,6 +728,61 @@ names and not ours to rename. And the `noctx` linter is right about
 
 ---
 
+## 15. OTP supervision, ported to Go (rev. 9)
+
+The bridge had a failure class it could not report. `serveSocket` returned on any
+`Accept` error and the process carried on: Claude still saw a healthy MCP server,
+Amp could never connect again, and nothing said so. An unrecovered panic anywhere
+was worse — it killed the channel for the whole session.
+
+That is the shape of the `:one_for_one` anti-pattern from
+[[OTP rest_for_one Supervision for Shared State]]: a sibling continuing to run
+while holding a dead reference to shared state.
+
+### What ported, and what did not
+
+| OTP idea | Bridge | Verdict |
+|---|---|---|
+| Bounded mailbox | `maxInFlight` | already had it |
+| `terminate/2` | `sync.OnceFunc` cleanup + signal handler | already had it |
+| Registry | `/tmp/amp-bridge-<uid>/*.json` | already had it |
+| Process isolation | `guard()` — `recover` per connection, per waiter, per request | **added** |
+| Supervisor restart | `superviseSocket` rebinds a lost listener | **added** |
+| `max_restarts` / `max_seconds` | `restartBudget`, 5 per minute, then exit non-zero | **added** |
+| GenServer for state | the pending-request map | **declined** |
+
+The last row is the one worth arguing. Turning `pending` into a
+GenServer-style owning goroutine would be the most literal translation and the
+least useful: it is twenty lines, mutex-guarded, race-tested, and an actor would
+add a hop while fixing no bug. Same reasoning as
+[[Atomics-Based Rate Limiter Design]] choosing atomics over a GenServer — a
+process earns its place when it buys concurrency or isolation, and here it buys
+neither.
+
+### Escalation, not infinite retry
+
+The supervisor rebinds the socket on loss, backing off 100 ms → 2 s. After five
+restarts inside a minute it stops and exits non-zero. Restarting forever would
+hide a permanent fault behind the same silence the change was meant to remove;
+giving up makes it visible.
+
+**Why self-heal rather than "let it crash" and be respawned?** Because the
+supervisor above us is unverified. Claude Code's binary contains
+`maxReconnectAttempts` and *"transport closed/disconnected, attempting automatic
+reconnection"*, but whether it respawns a dead stdio MCP server has never been
+tested. A fail-fast design would have been betting the bridge's availability on
+that. Self-healing works either way, and still exits when the fault is permanent.
+
+### Realistic trigger
+
+Not a hypothetical. The socket lives under `/tmp`, which macOS periodically
+sweeps. Losing the path leaves exactly the silent-degradation state above.
+
+85 tests, 78.7% coverage. The supervision tests cover rebind-after-loss, silence
+on deliberate shutdown, escalation when every rebind fails, and panic containment.
+
+---
+
 ## Open questions
 
 1. ~~Which protocol era must a channel server negotiate?~~ **Answered:** Claude proposes `2025-11-25`
@@ -752,7 +807,7 @@ filesystem state, the `SendMessage` tool contract, and `--help` output. Minified
 traced by hand. Claims resting on a single decompiled expression rather than observed behaviour are
 marked as such. No live-session messaging was performed.
 
-**Changelog.** Rev. 8: added §14 — removed the superseded Python probe, the `AMP_BRIDGE_PROTOCOL` escape hatch (built on the wrong reading of the era trap) and other dead code; moved configuration out of package globals into a `config` struct so tests are hermetic; replaced the Python e2e harness with a two-tier Go suite (66 tests, `-race`, 77.7% coverage) after validating the refactor against the old harness; added `.golangci.yml` (29 linters) and a `make check` gate. Rev. 3: added §10 — built and ran an instrumented probe server; captured Claude's real
+**Changelog.** Rev. 9: added §15 — ported OTP supervision to the Go bridge after live testing of ask_amp; added panic containment (`guard`), listener supervision with rebind, and a bounded restart budget that escalates by exiting rather than retrying forever; declined the GenServer-for-state translation with reasoning. Rev. 8: added §14 — removed the superseded Python probe, the `AMP_BRIDGE_PROTOCOL` escape hatch (built on the wrong reading of the era trap) and other dead code; moved configuration out of package globals into a `config` struct so tests are hermetic; replaced the Python e2e harness with a two-tier Go suite (66 tests, `-race`, 77.7% coverage) after validating the refactor against the old harness; added `.golangci.yml` (29 linters) and a `make check` gate. Rev. 3: added §10 — built and ran an instrumented probe server; captured Claude's real
 MCP handshake (`2025-11-25`, modern era), confirmed the era trap and the `not-in-era` mechanism, pinned
 the channel payload fields, resolved account eligibility (policy-blocked on `claude_max`), and found
 the `--scope local` clobber. Rev. 2: added §6 Channels (missed in rev. 1 — caught by the Amp-side research);
