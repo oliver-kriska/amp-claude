@@ -89,6 +89,13 @@ routing around a denial defeats the point of it.
 Keep messages self-contained. Claude sees the text and nothing else — not your
 thread history, not your files, not your tool output.
 
+**If Claude started the exchange with `ask_amp`, do not call `amp-bridge --ask`
+in that same turn.** Claude's session is blocked inside the tool call until your
+turn ends, so it cannot answer an inbound event; your `--ask` would block until
+it timed out at 180 s. Just answer in your turn output — that is what Claude
+receives. `amp-bridge --list` is fine either way, since it only reads the
+registry.
+
 ## Building and testing
 
 Toolchain is pinned in `.tool-versions` (mise): Go 1.26.6 and
