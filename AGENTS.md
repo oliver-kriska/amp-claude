@@ -98,6 +98,13 @@ routing around a denial defeats the point of it.
 Keep messages self-contained. Claude sees the text and nothing else — not your
 thread history, not your files, not your tool output.
 
+`ask_amp` is also refused outright when you have the thread open interactively:
+Amp permits one executor per thread, and `threads continue --execute` cannot
+attach a second. So for a thread you are sitting in, the inbound direction is the
+only one that works — you call `amp-bridge --ask`, Claude answers with `reply`.
+Claude gets a diagnostic naming the pid holding the thread rather than Amp's
+`Unexpected error inside Amp CLI`.
+
 **If Claude started the exchange with `ask_amp`, do not call `amp-bridge --ask`
 in that same turn.** Claude's session is blocked inside the tool call until your
 turn ends, so it cannot answer an inbound event; your `--ask` would block until
