@@ -85,11 +85,26 @@ check: tidy fmt-check vet lint test test-integration ## Everything above
 	@echo "all checks passed"
 
 .PHONY: tools
-tools: ## Report on required tooling
+tools: ## Report tool versions and flag drift from ../.tool-versions
 	@command -v golangci-lint >/dev/null || \
-		{ echo "golangci-lint missing: brew install golangci-lint"; exit 1; }
-	@golangci-lint --version
+		{ echo "golangci-lint missing: run 'mise install' from the repo root"; exit 1; }
 	@$(GO) version
+	@golangci-lint --version | head -1
+	@command -v mise >/dev/null 2>&1 || exit 0; \
+	want=$$(mise current go 2>/dev/null); \
+	have=$$($(GO) env GOVERSION 2>/dev/null | sed 's/^go//'); \
+	if [ -n "$$want" ] && [ "$$want" != "$$have" ]; then \
+		echo "warning: go $$have in use, ../.tool-versions pins $$want (run 'mise install')"; \
+	fi; \
+	wantl=$$(mise current golangci-lint 2>/dev/null); \
+	havel=$$(golangci-lint --version 2>/dev/null | sed -n 's/.*version \([0-9.]*\) .*/\1/p'); \
+	if [ -n "$$wantl" ] && [ "$$wantl" != "$$havel" ]; then \
+		echo "warning: golangci-lint $$havel in use, ../.tool-versions pins $$wantl"; \
+	fi
+
+.PHONY: outdated
+outdated: ## List dependency updates (there are none by design — see go.mod)
+	$(GO) list -u -m all
 
 .PHONY: clean
 clean: ## Remove build and coverage artefacts

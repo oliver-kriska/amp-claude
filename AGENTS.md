@@ -91,12 +91,22 @@ thread history, not your files, not your tool output.
 
 ## Building and testing
 
+Toolchain is pinned in `.tool-versions` (mise): Go 1.26.6 and
+golangci-lint 2.12.2. Run `mise install` once at the repo root; `make tools`
+reports the active versions and warns if they have drifted from the pins.
+
 ```bash
+mise install           # once, at the repo root
 cd amp-bridge
 make build             # rm-then-build: overwriting a Mach-O breaks its macOS signature
 make install           # copy to ~/.local/bin (PREFIX= to change)
 make check             # tidy, format, vet, lint, and both test tiers — the gate
 ```
+
+**The module has no dependencies and must not gain one.** `make outdated` will
+always be empty. An MCP SDK would implement `server/discover`, which wins the
+modern handshake negotiation and silently kills channel delivery — the reason
+the transport is hand-rolled. `go.mod` carries this warning too.
 
 `make install` is what the running channel uses: `.mcp.json` points at the
 installed binary, not the one in this tree. Building alone changes nothing a
