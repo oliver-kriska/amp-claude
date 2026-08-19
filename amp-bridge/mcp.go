@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -96,6 +97,17 @@ type bridge struct {
 	// Amp turns are serialised: two concurrent `threads continue` runs against
 	// one thread would interleave writes to the same conversation.
 	askMu sync.Mutex
+
+	// ctx is cancelled on shutdown. Tool calls run off the read loop, so
+	// without it an `amp threads continue` subprocess outlives the bridge as an
+	// orphan. toolWG lets shutdown wait for that work to unwind.
+	ctx       context.Context
+	cancelCtx context.CancelFunc
+	toolWG    sync.WaitGroup
+
+	// Registry entry, republished by the watchdog if it is swept.
+	reg     registryEntry
+	regPath string
 }
 
 func (b *bridge) listener() net.Listener {
@@ -110,7 +122,12 @@ func (b *bridge) setListener(ln net.Listener) {
 	b.lnMu.Unlock()
 }
 
-func (b *bridge) beginShutdown() { b.downOnce.Do(func() { close(b.downCh) }) }
+func (b *bridge) beginShutdown() {
+	b.downOnce.Do(func() {
+		close(b.downCh)
+		b.cancelCtx() // kills any in-flight Amp subprocess
+	})
+}
 
 func (b *bridge) shuttingDown() bool {
 	select {
@@ -128,7 +145,7 @@ func (b *bridge) escalate() { b.fatalOnce.Do(func() { close(b.fatalCh) }) }
 func (b *bridge) fatalSignal() <-chan struct{} { return b.fatalCh }
 
 func newBridge(cfg config, out, logw io.Writer) *bridge {
-	return &bridge{
+	b := &bridge{
 		cfg:     cfg,
 		out:     bufio.NewWriter(out),
 		logw:    logw,
@@ -141,6 +158,8 @@ func newBridge(cfg config, out, logw io.Writer) *bridge {
 		restartBackoff: 100 * time.Millisecond,
 		socketCheck:    5 * time.Second,
 	}
+	b.ctx, b.cancelCtx = context.WithCancel(context.Background())
+	return b
 }
 
 func (b *bridge) logf(format string, args ...any) {
@@ -168,29 +187,41 @@ func (b *bridge) logFrame(dir, method string, id json.RawMessage, raw []byte) {
 	b.logf("%s method=%s id=%s bytes=%d", dir, method, strings.TrimSpace(string(id)), len(raw))
 }
 
-func (b *bridge) send(msg rpc) {
+// send returns a transport error rather than only logging it: an unsolicited
+// event that never reached Claude must unwind its pending slot, or the Amp
+// caller blocks for the full timeout waiting on a message nobody received.
+func (b *bridge) send(msg rpc) error {
 	msg.JSONRPC = "2.0"
 	data, err := json.Marshal(msg)
 	if err != nil {
 		b.logf("MARSHAL_ERROR %v", err)
-		return
+		return fmt.Errorf("marshal %s: %w", msg.Method, err)
 	}
+
 	b.outMu.Lock()
-	_, _ = b.out.Write(data)
-	_ = b.out.WriteByte('\n')
-	err = b.out.Flush()
+	_, werr := b.out.Write(data)
+	if werr == nil {
+		werr = b.out.WriteByte('\n')
+	}
+	if werr == nil {
+		werr = b.out.Flush()
+	}
 	b.outMu.Unlock()
-	if err != nil {
-		b.logf("SEND_ERROR method=%s %v", msg.Method, err)
-		return
+
+	if werr != nil {
+		b.logf("SEND_ERROR method=%s %v", msg.Method, werr)
+		return fmt.Errorf("write %s: %w", msg.Method, werr)
 	}
 	b.logFrame("<<SENT", msg.Method, msg.ID, data)
+	return nil
 }
 
-func (b *bridge) reply(id json.RawMessage, result any) { b.send(rpc{ID: id, Result: result}) }
+// reply and fail answer a request Claude is already waiting on; a transport
+// failure there is logged by send and there is nowhere better to report it.
+func (b *bridge) reply(id json.RawMessage, result any) { _ = b.send(rpc{ID: id, Result: result}) }
 
 func (b *bridge) fail(id json.RawMessage, code int, message string) {
-	b.send(rpc{ID: id, Error: &rpcError{Code: code, Message: message}})
+	_ = b.send(rpc{ID: id, Error: &rpcError{Code: code, Message: message}})
 }
 
 // toolResult builds the MCP content envelope every tool call answers with.
@@ -241,13 +272,13 @@ func (b *bridge) dispatch(msg rpc) {
 		// minutes; handling it inline stalls the whole transport — no ping, no
 		// reply from Claude, not even stdin EOF noticed. JSON-RPC correlates by
 		// id and send is mutex-guarded, so answering out of order is fine.
-		go func() {
+		b.toolWG.Go(func() {
 			if panicked := b.guard("tools/call", func() { b.handleToolsCall(msg) }); panicked {
 				if len(msg.ID) > 0 {
 					b.fail(msg.ID, errInternal, "internal error handling tools/call")
 				}
 			}
-		}()
+		})
 
 	case "ping":
 		b.reply(msg.ID, map[string]any{})
@@ -339,10 +370,10 @@ func (b *bridge) handleReply(id, args json.RawMessage) {
 	switch res {
 	case resolveOK:
 		b.reply(id, toolResult("delivered to Amp (request_id "+rid+")", false))
-	case resolveAmbiguous:
-		b.reply(id, toolResult("request_id is required: more than one Amp request is in "+
-			"flight, so the reply could not be routed. Call reply again with the request_id "+
-			"attribute from the <channel> event you are answering.", true))
+	case resolveMissingID:
+		b.reply(id, toolResult("request_id is required. The reply was not routed and no one "+
+			"received it. Call reply again, passing the request_id attribute from the "+
+			"<channel> event you are answering.", true))
 	default:
 		b.reply(id, toolResult("no pending Amp request matches request_id "+rid+
 			" — it may have already timed out. Reply dropped.", true))

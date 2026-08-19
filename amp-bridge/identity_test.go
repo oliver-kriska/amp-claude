@@ -280,7 +280,10 @@ func TestPublishAndListBridges(t *testing.T) {
 		t.Fatalf("publish stale: %v", err)
 	}
 
-	got := listBridges()
+	got, lbErr := listBridges()
+	if lbErr != nil {
+		t.Fatalf("listBridges: %v", lbErr)
+	}
 	if len(got) != 1 || got[0].Name != "live" {
 		t.Fatalf("listBridges = %+v, want only the live entry", got)
 	}
@@ -296,7 +299,11 @@ func TestListBridgesIgnoresJunkFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "junk.json"), []byte("not json"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if got := listBridges(); len(got) != 0 {
+	got, err := listBridges()
+	if err != nil {
+		t.Fatalf("listBridges: %v", err)
+	}
+	if len(got) != 0 {
 		t.Errorf("listBridges = %+v, want none", got)
 	}
 }

@@ -40,6 +40,19 @@ install: build ## Install to $(BINDIR) (override with PREFIX=/usr/local)
 	@command -v $(BIN) >/dev/null 2>&1 || \
 		echo "note: $(BINDIR) is not on your PATH — add it to use \`$(BIN)\` bare"
 
+# The directory whose .mcp.json gets the bridge. Defaults to the repo root, one
+# level up from this Makefile; point it at any project you want a bridge in:
+#   make setup PROJECT=~/Projects/other-app
+PROJECT ?= $(CURDIR)/..
+
+.PHONY: setup
+setup: install ## Build, install, and register the bridge in $(PROJECT)/.mcp.json
+	@$(BINDIR)/$(BIN) init $(PROJECT)
+
+.PHONY: doctor
+doctor: ## Diagnose the installed bridge against $(PROJECT)
+	@$(BINDIR)/$(BIN) doctor $(PROJECT)
+
 .PHONY: uninstall
 uninstall: ## Remove the installed binary
 	rm -f $(BINDIR)/$(BIN)

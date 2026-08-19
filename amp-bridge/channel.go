@@ -18,7 +18,7 @@ import (
 // pushEvent registers a pending request and pushes it to Claude as an
 // unsolicited channel notification. The returned channel receives Claude's
 // reply exactly once; the caller must drop the id if it stops waiting.
-func (b *bridge) pushEvent(text string) (string, chan string, error) {
+func (b *bridge) pushEvent(text, threadID string) (string, chan string, error) {
 	b.pendMu.Lock()
 	if len(b.pending) >= b.cfg.maxInFlight {
 		n := len(b.pending)
@@ -33,18 +33,29 @@ func (b *bridge) pushEvent(text string) (string, chan string, error) {
 	b.pending[id] = sink
 	b.pendMu.Unlock()
 
-	b.send(rpc{
+	// It is `meta`, NOT the MCP-standard `_meta`. Keys must be identifiers and
+	// values render as attributes on the <channel> tag. Do NOT use "source" —
+	// Claude sets that attribute itself, and a duplicate emits it twice.
+	// Confirmed live: <channel source="amp-bridge" request_id="..." source="amp">
+	meta := map[string]string{"request_id": id}
+	// Carrying the originating thread lets Claude answer the right Amp thread
+	// with ask_amp when several share one session, instead of relying on
+	// "whichever messaged us last".
+	if threadID != "" {
+		meta["thread_id"] = threadID
+	}
+
+	if err := b.send(rpc{
 		Method: "notifications/claude/channel",
-		Params: mustJSON(map[string]any{
-			"content": text,
-			// It is `meta`, NOT the MCP-standard `_meta`. Keys must be
-			// identifiers and values render as attributes on the <channel> tag.
-			// Do NOT use "source" — Claude sets that attribute itself, and a
-			// duplicate emits it twice. Confirmed live:
-			//   <channel source="amp-bridge" request_id="..." source="amp">
-			"meta": map[string]string{"request_id": id},
-		}),
-	})
+		Params: mustJSON(map[string]any{"content": text, "meta": meta}),
+	}); err != nil {
+		// The event never reached Claude, so nothing will ever answer it.
+		// Holding the slot would cost the caller the full timeout for a message
+		// that was never delivered.
+		b.drop(id)
+		b.logf("EVENT_PUSH_FAILED request_id=%s %v", id, err)
+		return "", nil, fmt.Errorf("could not deliver the event to Claude: %w", err)
+	}
 	b.logf("EVENT_PUSHED request_id=%s bytes=%d", id, len(text))
 	return id, sink, nil
 }
@@ -60,7 +71,7 @@ type resolveResult int
 const (
 	resolveOK resolveResult = iota
 	resolveUnknownID
-	resolveAmbiguous
+	resolveMissingID
 )
 
 func (r resolveResult) String() string {
@@ -69,8 +80,8 @@ func (r resolveResult) String() string {
 		return "ok"
 	case resolveUnknownID:
 		return "unknown-id"
-	case resolveAmbiguous:
-		return "ambiguous"
+	case resolveMissingID:
+		return "missing-id"
 	default:
 		return "unknown"
 	}
@@ -78,20 +89,19 @@ func (r resolveResult) String() string {
 
 // resolve routes Claude's reply to the Amp request waiting on it.
 //
-// request_id is required whenever more than one request is in flight. Falling
-// back to "the most recent" would silently mis-route concurrent calls, so an
-// omitted id is honoured only when exactly one request is pending.
+// request_id is always required. An earlier version accepted an omitted id when
+// exactly one request happened to be pending, which is unsound across a timeout
+// boundary: A times out and is dropped, B becomes the sole pending request, and
+// a belated id-less answer meant for A is handed to B. The tool schema marks
+// request_id required, so inferring it only ever serves a client that is already
+// violating the contract — at the cost of the exact mis-routing this correlation
+// exists to prevent.
 func (b *bridge) resolve(id, text string) (resolveResult, string) {
 	b.pendMu.Lock()
 	defer b.pendMu.Unlock()
 
 	if id == "" {
-		if len(b.pending) != 1 {
-			return resolveAmbiguous, ""
-		}
-		for k := range b.pending {
-			id = k
-		}
+		return resolveMissingID, ""
 	}
 	sink, ok := b.pending[id]
 	if !ok {
@@ -184,7 +194,7 @@ func (b *bridge) serveAmpConn(conn net.Conn) {
 			continue
 		}
 
-		id, sink, err := b.pushEvent(req.Text)
+		id, sink, err := b.pushEvent(req.Text, req.ThreadID)
 		if err != nil {
 			b.logf("AMP_REJECTED %v", err)
 			respond(ampResponse{Error: err.Error()})

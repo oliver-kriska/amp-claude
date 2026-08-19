@@ -1,6 +1,6 @@
 # Amp ↔ Claude Code bridge — research from the Claude Code side
 
-**Date:** 2026-08-19 (rev. 2, after Amp-side synthesis)
+**Date:** 2026-08-19 (rev. 11)
 **Context:** Independent Claude-Code-side investigation of the cross-session messaging layer, decoded
 from the shipped binary and verified against live state. Rev. 2 incorporates the Amp-side finding that
 **Channels** — not synthetic peer registration — is the officially supported integration point, plus
@@ -851,6 +851,75 @@ microseconds before exit.
 
 ---
 
+## 17. Peer review over the bridge, and the installation story (rev. 11)
+
+The second review came from Amp, and it arrived **through the bridge** — a 3.6 KB
+channel event, answered with a 4.5 KB `reply`. The artefact reviewed itself over
+itself. Worth recording because it is the first use of the thing for the thing it
+was built for, and because the round trip (10:52:32 → 10:54:00, 88 s) is a fair
+sample of real turn latency: almost all of it is Claude thinking, not transport.
+
+### Findings fixed
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | `pushEvent` ignored the result of `send`. A failed write left the request registered, so the caller waited the full 180 s for an event that never left the process. | `send` returns an error; on failure the slot is dropped and the caller is told immediately. |
+| 2 | Registry publication failure was non-fatal — the bridge ran healthy and undiscoverable, which is exactly the silent-failure class this design keeps tripping over. | Fatal. Fail loudly at startup instead. |
+| 3 | `listBridges` swallowed the symlink refusal from `trustedRuntimeDir` and reported "no live sessions". A planted `/tmp` symlink read as *nothing is running*, not as *something is wrong*. | The error propagates; `--ask` and `--list` exit 2 with the refusal. |
+| 4 | The empty-`request_id` fallback (deferred in §16) could hand A's belated answer to B across a timeout boundary. | Removed entirely. `request_id` is required by the tool schema, so inferring it only ever accommodated a client already violating the contract — at the cost of the mis-routing correlation exists to prevent. |
+| 5 | `askAmp` derived its context from `Background`, so a shutdown left `amp threads continue` running as an orphan. | Derived from the bridge context, with a distinct "shutting down" error so cancellation is not misreported as an Amp failure. |
+| 6 | Long session names overflowed `sockaddr_un`'s ~104-byte limit; `bind` then failed with an error naming neither the length nor the culprit. | `capSocketName` caps the name against the directory length before binding. |
+
+### Routing, not guessing
+
+Amp's substantive request was addressing: with one thread the "reply to whoever
+messaged last" fallback is fine, with two it is wrong. `--thread` now rides along
+in the notification meta, so the event Claude sees is
+
+```
+<channel source="amp-bridge" request_id="amp-…-2" thread_id="T-abc123">
+```
+
+and `ask_amp` can be pointed at the originating thread rather than the most
+recent one. This is the first use of `meta` for anything beyond correlation, and
+it confirms the field takes arbitrary identifier keys, not just `request_id`.
+
+### `doctor` — making the quiet failures loud
+
+Every failure this project has hit reports healthy from the inside. The channel
+not loaded, `.mcp.json` pointing at a stale build, a binary whose signature was
+invalidated by `cp`, a registry entry nobody published: in all of them the
+process runs, the logs look ordinary, and messages simply never arrive.
+
+`amp-bridge doctor` checks the six places that can be individually fine while the
+system is broken — binary on PATH vs. `os.Executable()`, `.mcp.json` target vs.
+this build, runtime directory trust, live sessions, the Amp CLI, and log
+freshness — prints the fixing command for anything wrong, and exits non-zero.
+
+The check that earns its keep is `.mcp.json` drift. `make build` does not change
+what a live session launches, and neither does `make install` without a restart;
+the resulting "I fixed it and nothing changed" is the most common self-inflicted
+confusion here. `doctor` compares the configured path against the running binary
+and says so:
+
+```
+[FAIL] mcp config  points at /nonexistent/amp-bridge, which does not exist
+       fix: amp-bridge init
+```
+
+Verified by breaking it deliberately: no `.mcp.json` → warn, exit 0; stale path →
+FAIL, exit 1; `amp-bridge init` → repaired, recheck green.
+
+`init` merges into an existing `.mcp.json` rather than overwriting it (other MCP
+servers survive) and refuses a file it cannot parse rather than clobbering it.
+`make setup` is build + install + init in one step, with `PROJECT=` to register
+the bridge in a different project.
+
+99 tests, 161 including subtests. Docs split three ways by reader: `README.md` for a human installing it,
+`AGENTS.md` for Amp driving it, `SKILL.md` for Claude answering on it.
+
+---
+
 ## Open questions
 
 1. ~~Which protocol era must a channel server negotiate?~~ **Answered:** Claude proposes `2025-11-25`
@@ -875,7 +944,7 @@ filesystem state, the `SendMessage` tool contract, and `--help` output. Minified
 traced by hand. Claims resting on a single decompiled expression rather than observed behaviour are
 marked as such. No live-session messaging was performed.
 
-**Changelog.** Rev. 10: added §16 — external adversarial review; fixed six confirmed defects, the worst being that the socket watchdog watched a signal that can never fire (unlinking a Unix socket does not fail Accept) and its test simulated the wrong failure; corrected the §15 rationale accordingly. Rev. 9: added §15 — ported OTP supervision to the Go bridge after live testing of ask_amp; added panic containment (`guard`), listener supervision with rebind, and a bounded restart budget that escalates by exiting rather than retrying forever; declined the GenServer-for-state translation with reasoning. Rev. 8: added §14 — removed the superseded Python probe, the `AMP_BRIDGE_PROTOCOL` escape hatch (built on the wrong reading of the era trap) and other dead code; moved configuration out of package globals into a `config` struct so tests are hermetic; replaced the Python e2e harness with a two-tier Go suite (66 tests, `-race`, 77.7% coverage) after validating the refactor against the old harness; added `.golangci.yml` (29 linters) and a `make check` gate. Rev. 3: added §10 — built and ran an instrumented probe server; captured Claude's real
+**Changelog.** Rev. 11: added §17 — peer review received over the bridge itself; fixed six findings (unchecked `send` result, non-fatal registry publish, swallowed symlink refusal, the empty-`request_id` fallback removed outright, orphaned Amp subprocess on shutdown, `sockaddr_un` overflow); added `thread_id` routing in the notification meta, and `doctor`/`init`/`make setup` so the quiet failure modes announce themselves. Rev. 10: added §16 — external adversarial review; fixed six confirmed defects, the worst being that the socket watchdog watched a signal that can never fire (unlinking a Unix socket does not fail Accept) and its test simulated the wrong failure; corrected the §15 rationale accordingly. Rev. 9: added §15 — ported OTP supervision to the Go bridge after live testing of ask_amp; added panic containment (`guard`), listener supervision with rebind, and a bounded restart budget that escalates by exiting rather than retrying forever; declined the GenServer-for-state translation with reasoning. Rev. 8: added §14 — removed the superseded Python probe, the `AMP_BRIDGE_PROTOCOL` escape hatch (built on the wrong reading of the era trap) and other dead code; moved configuration out of package globals into a `config` struct so tests are hermetic; replaced the Python e2e harness with a two-tier Go suite (66 tests, `-race`, 77.7% coverage) after validating the refactor against the old harness; added `.golangci.yml` (29 linters) and a `make check` gate. Rev. 3: added §10 — built and ran an instrumented probe server; captured Claude's real
 MCP handshake (`2025-11-25`, modern era), confirmed the era trap and the `not-in-era` mechanism, pinned
 the channel payload fields, resolved account eligibility (policy-blocked on `claude_max`), and found
 the `--scope local` clobber. Rev. 2: added §6 Channels (missed in rev. 1 — caught by the Amp-side research);

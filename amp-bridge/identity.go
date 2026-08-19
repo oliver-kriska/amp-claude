@@ -66,8 +66,7 @@ func runtimeDir() string {
 func ensureRuntimeDir() (string, error) {
 	dir := runtimeDir()
 
-	fi, err := os.Lstat(dir)
-	switch {
+	switch _, err := trustedRuntimeDir(); {
 	case errors.Is(err, os.ErrNotExist):
 		if mkErr := os.Mkdir(dir, 0o700); mkErr != nil {
 			return "", fmt.Errorf("create runtime dir %s: %w", dir, mkErr)
@@ -75,10 +74,6 @@ func ensureRuntimeDir() (string, error) {
 		return dir, nil
 	case err != nil:
 		return "", err
-	case fi.Mode()&os.ModeSymlink != 0:
-		return "", fmt.Errorf("runtime dir %s is a symlink — refusing to use it", dir)
-	case !fi.IsDir():
-		return "", fmt.Errorf("runtime dir %s exists but is not a directory", dir)
 	}
 
 	// Re-assert perms in case the directory predates us and was looser.
@@ -136,6 +131,7 @@ func resolveIdentity() (name, sock string, entry registryEntry) {
 	}
 
 	dir := runtimeDir()
+	name = capSocketName(dir, name)
 	sock = filepath.Join(dir, name+".sock")
 	if v := os.Getenv("AMP_BRIDGE_SOCKET"); v != "" {
 		sock = v // explicit override wins, single-session mode
@@ -162,6 +158,41 @@ func shortID(s string) string {
 		return s[:8]
 	}
 	return s
+}
+
+// trustedRuntimeDir returns the runtime directory only if it is one we can
+// trust: a real directory, not a symlink another local user planted.
+//
+// Both the server and the *client* must check this. /tmp is world-writable, so
+// an attacker who pre-creates our directory name as a symlink to a directory of
+// theirs — holding a live socket and a matching registry entry — would have
+// `--ask` deliver the user's prompt straight into it. That is exfiltration, not
+// merely denial of service, and discovery used to glob the path unchecked.
+func trustedRuntimeDir() (string, error) {
+	dir := runtimeDir()
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("runtime dir %s is a symlink — refusing to use it", dir)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("runtime dir %s exists but is not a directory", dir)
+	}
+	return dir, nil
+}
+
+// capSocketName keeps dir/name.sock inside the platform's ~104-byte sockaddr_un
+// limit. Overflowing it fails at bind with an opaque error that names neither
+// the length nor the culprit.
+func capSocketName(dir, name string) string {
+	const pathLimit = 100
+	budget := max(pathLimit-len(dir)-len("/")-len(".sock"), 8)
+	if len(name) > budget {
+		name = strings.TrimRight(name[:budget], "-")
+	}
+	return name
 }
 
 // bindSocket binds the listener, refusing to steal a socket another live bridge
@@ -217,11 +248,19 @@ func (e registryEntry) publish() (string, error) {
 }
 
 // listBridges returns every live bridge, dropping entries whose socket is dead.
-func listBridges() []registryEntry {
-	dir := runtimeDir()
+// It refuses an untrustworthy runtime directory rather than reading whatever it
+// finds there — see trustedRuntimeDir.
+func listBridges() ([]registryEntry, error) {
+	dir, err := trustedRuntimeDir()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil // nothing has run yet; not an error
+		}
+		return nil, err
+	}
 	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var out []registryEntry
 	for _, f := range files {
@@ -240,5 +279,5 @@ func listBridges() []registryEntry {
 		}
 		out = append(out, e)
 	}
-	return out
+	return out, nil
 }

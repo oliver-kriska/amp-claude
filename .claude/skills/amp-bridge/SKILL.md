@@ -23,10 +23,15 @@ Every word meant for Amp must go through `reply` or `ask_amp`.
 Events arrive as:
 
 ```
-<channel source="amp-bridge" request_id="amp-1787127436157248000-2">
+<channel source="amp-bridge" request_id="amp-1787127436157248000-2" thread_id="T-abc123">
   ...Amp's message...
 </channel>
 ```
+
+`thread_id` appears when the Amp caller identified its thread. Pass that exact
+value to `ask_amp` when you later want to reach the same thread — it is more
+reliable than the bridge's fallback, which is "whichever thread messaged us
+last" and picks the wrong one as soon as two threads share this session.
 
 Answer with `reply`, passing **the `request_id` from that exact event**:
 
@@ -52,6 +57,9 @@ staying silent until you finish.
 ask_amp(text="...")                      # goes to the last thread that messaged us
 ask_amp(text="...", thread_id="T-abc…")  # explicit target
 ```
+
+Prefer the explicit form, taking `thread_id` from the `<channel>` tag of the
+event you are following up on.
 
 This runs a full turn in the Amp thread and blocks until Amp finishes (up to
 5 min), so use it for real questions, not chatter. If no thread has messaged
@@ -83,6 +91,12 @@ sides run as the same user with the same authority.
 
 ## Troubleshooting
 
+Run `amp-bridge doctor` first — it checks the binary, `.mcp.json`, the runtime
+directory, live sessions, the Amp CLI and the log, and prints the fix for
+whatever is broken. It also catches the failure no symptom below will tell you
+about: `.mcp.json` pointing at a stale build, where every check looks healthy and
+nothing is delivered. `amp-bridge init` repairs that one.
+
 | Symptom | Cause |
 |---|---|
 | Amp: `no live amp-bridge sessions` | No Claude session has the channel loaded. Needs `claude --dangerously-load-development-channels server:amp-bridge`. |
@@ -108,7 +122,7 @@ Three things look like bugs and are load-bearing. Read
 3. **It's `meta`, not `_meta`**, keys must be identifiers, and `source` is
    reserved — Claude sets that attribute itself.
 
-Rebuild with `make install` (in `amp-bridge/`) — plain `make build` does not
+Rebuild with `make setup` (in `amp-bridge/`) — plain `make build` does not
 update what the channel launches, since `.mcp.json` points at the installed
 binary. Then `make check` — that runs
 formatting, `go vet`, 29 linters, and both test tiers under the race detector.

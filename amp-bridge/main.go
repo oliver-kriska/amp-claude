@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 type runMode int
@@ -40,6 +41,8 @@ const (
 	modeList
 	modeAsk
 	modeHelp
+	modeDoctor
+	modeInit
 )
 
 type options struct {
@@ -47,11 +50,14 @@ type options struct {
 	session string
 	thread  string
 	text    string
+	dir     string
 }
 
 const usage = `amp-bridge — bridge an Amp thread to a Claude Code session
 
   amp-bridge                            run as an MCP stdio server (Claude spawns this)
+  amp-bridge init [dir]                 write .mcp.json pointing at this binary
+  amp-bridge doctor [dir]               diagnose why the channel is not working
   amp-bridge --list                     list live bridges
   amp-bridge [--session N] [--thread T] --ask "text"
 
@@ -70,7 +76,13 @@ Environment:
 // parseArgs is strict: an unrecognised flag is an error rather than a silent
 // no-op, because a typo'd flag otherwise looks like the feature simply failing.
 func parseArgs(args []string) (options, error) {
-	o := options{mode: modeServe}
+	o := options{mode: modeServe, dir: "."}
+
+	// Subcommands come first and take an optional directory.
+	if sub, ok := parseSubcommand(args); ok {
+		return sub, subcommandError(args)
+	}
+
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--list":
@@ -103,6 +115,34 @@ func parseArgs(args []string) (options, error) {
 	return o, nil
 }
 
+// parseSubcommand recognises the verb form (`init`, `doctor`), which takes an
+// optional directory rather than flags.
+func parseSubcommand(args []string) (options, bool) {
+	if len(args) == 0 {
+		return options{}, false
+	}
+	o := options{dir: "."}
+	switch args[0] {
+	case "init":
+		o.mode = modeInit
+	case "doctor":
+		o.mode = modeDoctor
+	default:
+		return options{}, false
+	}
+	if len(args) >= 2 {
+		o.dir = args[1]
+	}
+	return o, true
+}
+
+func subcommandError(args []string) error {
+	if len(args) > 2 {
+		return fmt.Errorf("%s takes at most one directory", args[0])
+	}
+	return nil
+}
+
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
@@ -123,6 +163,10 @@ func run(args []string) int {
 		return cmdList()
 	case modeAsk:
 		return cmdAsk(cfg, opts.session, opts.thread, opts.text)
+	case modeInit:
+		return cmdInit(opts.dir)
+	case modeDoctor:
+		return cmdDoctor(cfg, opts.dir)
 	case modeServe:
 		return runServer(cfg)
 	default:
@@ -194,11 +238,17 @@ func runServer(cfg config) int {
 		fmt.Fprintf(os.Stderr, "amp-bridge: %v\n", err)
 		return 1
 	}
+	// Fatal. Without a registration no client can discover us: `--list` shows
+	// nothing and `--ask` cannot find a target, so the bridge is running,
+	// healthy and unreachable — the exact silent failure this codebase keeps
+	// having to design against.
 	regPath, err := entry.publish()
 	if err != nil {
-		// Not fatal: the bridge still works, it is just undiscoverable.
 		b.logf("REGISTRY_PUBLISH_FAILED %v", err)
+		fmt.Fprintf(os.Stderr, "amp-bridge: cannot publish registry entry: %v\n", err)
+		return 1
 	}
+	b.reg, b.regPath = entry, regPath
 
 	b.logf("=== %s %s started name=%s pid=%d claude_pid=%d socket=%s bodies=%v ===",
 		serverName, serverVersion, name, os.Getpid(), entry.ClaudePID, sock, cfg.logBodies)
@@ -240,13 +290,36 @@ func runServer(cfg config) int {
 		close(done)
 	}()
 
+	code := 0
 	select {
 	case <-done:
-		return 0
 	case <-b.fatalSignal():
 		fmt.Fprintln(os.Stderr,
 			"amp-bridge: socket supervision exhausted its restart budget; exiting")
-		return 1
+		code = 1
+	}
+
+	b.drainToolWork()
+	return code
+}
+
+// drainToolWork cancels in-flight tool calls and waits briefly for them.
+//
+// Tool calls run off the read loop, so an ask_amp subprocess may still be
+// mid-turn when Claude closes stdin. Without this, `amp threads continue`
+// outlives the session as an orphan.
+func (b *bridge) drainToolWork() {
+	b.beginShutdown()
+
+	drained := make(chan struct{})
+	go func() {
+		b.toolWG.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(3 * time.Second):
+		b.logf("SHUTDOWN_TIMEOUT in-flight tool work did not unwind in time")
 	}
 }
 

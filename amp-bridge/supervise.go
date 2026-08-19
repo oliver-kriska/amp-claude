@@ -127,6 +127,28 @@ func (b *bridge) superviseSocket(sock string) {
 	}
 }
 
+// ensureRegistered re-publishes the registry entry if it has gone missing.
+//
+// The socket and the registry entry are swept by the same tmp cleaner, but only
+// the socket had a detector. A bridge whose registration is gone is invisible to
+// `--list` and `--ask` — running, healthy, and unreachable, which is the failure
+// mode this whole subsystem exists to eliminate. publish() recreates the runtime
+// directory too, so a wholesale sweep recovers.
+func (b *bridge) ensureRegistered() {
+	if b.regPath == "" {
+		return
+	}
+	if _, err := os.Lstat(b.regPath); err == nil {
+		return
+	}
+	path, err := b.reg.publish()
+	if err != nil {
+		b.logf("REGISTRY_REPUBLISH_FAILED %v", err)
+		return
+	}
+	b.logf("REGISTRY_REPUBLISHED %s — the bridge is discoverable again", path)
+}
+
 // watchAndServe runs the accept loop while watching the socket path.
 //
 // This watchdog exists because of a Unix detail that is easy to get wrong:
@@ -159,6 +181,7 @@ func (b *bridge) watchAndServe(sock string, ln net.Listener) {
 					sock, err)
 				_ = ln.Close() // unblocks Accept; serveSocket returns
 			}
+			b.ensureRegistered()
 		}
 	}
 }

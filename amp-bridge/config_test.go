@@ -13,24 +13,24 @@ func TestParseArgs(t *testing.T) {
 		args []string
 		want options
 	}{
-		{"no arguments means serve", nil, options{mode: modeServe}},
-		{"list", []string{"--list"}, options{mode: modeList}},
-		{"help", []string{"--help"}, options{mode: modeHelp}},
-		{"ask", []string{"--ask", "hello"}, options{mode: modeAsk, text: "hello"}},
+		{"no arguments means serve", nil, options{mode: modeServe, dir: "."}},
+		{"list", []string{"--list"}, options{mode: modeList, dir: "."}},
+		{"help", []string{"--help"}, options{mode: modeHelp, dir: "."}},
+		{"ask", []string{"--ask", "hello"}, options{mode: modeAsk, text: "hello", dir: "."}},
 		{
 			"everything after --ask is the message",
 			[]string{"--ask", "what", "is", "2+2?"},
-			options{mode: modeAsk, text: "what is 2+2?"},
+			options{mode: modeAsk, text: "what is 2+2?", dir: "."},
 		},
 		{
 			"session and thread",
 			[]string{"--session", "b1", "--thread", "T-7", "--ask", "hi"},
-			options{mode: modeAsk, session: "b1", thread: "T-7", text: "hi"},
+			options{mode: modeAsk, session: "b1", thread: "T-7", text: "hi", dir: "."},
 		},
 		{
 			"flags after --ask belong to the message",
 			[]string{"--ask", "use --list to see them"},
-			options{mode: modeAsk, text: "use --list to see them"},
+			options{mode: modeAsk, text: "use --list to see them", dir: "."},
 		},
 	}
 	for _, tc := range tests {
@@ -197,7 +197,7 @@ func TestResolveResultString(t *testing.T) {
 	tests := map[resolveResult]string{
 		resolveOK:        "ok",
 		resolveUnknownID: "unknown-id",
-		resolveAmbiguous: "ambiguous",
+		resolveMissingID: "missing-id",
 	}
 	for res, want := range tests {
 		if got := res.String(); got != want {

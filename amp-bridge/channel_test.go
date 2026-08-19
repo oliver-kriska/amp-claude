@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -20,7 +21,7 @@ func TestPushEventNotificationShape(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 
-	id, sink, err := h.b.pushEvent("what is 2+2?")
+	id, sink, err := h.b.pushEvent("what is 2+2?", "")
 	if err != nil {
 		t.Fatalf("pushEvent: %v", err)
 	}
@@ -72,7 +73,7 @@ func TestPushEventIDsAreDistinct(t *testing.T) {
 
 	seen := map[string]bool{}
 	for range 5 {
-		id, _, err := h.b.pushEvent("x")
+		id, _, err := h.b.pushEvent("x", "")
 		if err != nil {
 			t.Fatalf("pushEvent: %v", err)
 		}
@@ -88,11 +89,11 @@ func TestPushEventEnforcesInFlightCap(t *testing.T) {
 	h := newHarness(t, func(c *config) { c.maxInFlight = 3 })
 
 	for i := range 3 {
-		if _, _, err := h.b.pushEvent("x"); err != nil {
+		if _, _, err := h.b.pushEvent("x", ""); err != nil {
 			t.Fatalf("push %d should fit under the cap: %v", i, err)
 		}
 	}
-	_, _, err := h.b.pushEvent("one too many")
+	_, _, err := h.b.pushEvent("one too many", "")
 	if err == nil {
 		t.Fatal("the in-flight cap must be enforced; it is what stops a runaway loop flooding Claude")
 	}
@@ -102,7 +103,7 @@ func TestPushEventEnforcesInFlightCap(t *testing.T) {
 
 	// A released slot is reusable.
 	h.b.drop(firstPending(h.b))
-	if _, _, err := h.b.pushEvent("now there is room"); err != nil {
+	if _, _, err := h.b.pushEvent("now there is room", ""); err != nil {
 		t.Errorf("dropping a request must free its slot: %v", err)
 	}
 }
@@ -130,9 +131,14 @@ func TestResolveRouting(t *testing.T) {
 	}{
 		{"exact id with one pending", 1, 0, resolveOK},
 		{"exact id with several pending", 3, 1, resolveOK},
-		{"omitted id with exactly one pending", 1, -1, resolveOK},
-		{"omitted id with several pending is refused", 2, -1, resolveAmbiguous},
-		{"omitted id with none pending is refused", 0, -1, resolveAmbiguous},
+		// An omitted id is ALWAYS refused, even when exactly one request is
+		// pending. Inferring the target from cardinality is unsound across a
+		// timeout boundary: A times out and is dropped, B becomes the only
+		// pending request, and a belated id-less answer meant for A lands on B.
+		// This case previously expected resolveOK — the test was pinning the bug.
+		{"omitted id with exactly one pending is still refused", 1, -1, resolveMissingID},
+		{"omitted id with several pending is refused", 2, -1, resolveMissingID},
+		{"omitted id with none pending is refused", 0, -1, resolveMissingID},
 	}
 
 	for _, tc := range tests {
@@ -143,7 +149,7 @@ func TestResolveRouting(t *testing.T) {
 			ids := make([]string, 0, tc.pending)
 			sinks := make([]chan string, 0, tc.pending)
 			for range tc.pending {
-				id, sink, err := h.b.pushEvent("q")
+				id, sink, err := h.b.pushEvent("q", "")
 				if err != nil {
 					t.Fatalf("pushEvent: %v", err)
 				}
@@ -190,7 +196,7 @@ func TestResolveRouting(t *testing.T) {
 func TestResolveUnknownID(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	if _, _, err := h.b.pushEvent("q"); err != nil {
+	if _, _, err := h.b.pushEvent("q", ""); err != nil {
 		t.Fatalf("pushEvent: %v", err)
 	}
 
@@ -209,7 +215,7 @@ func TestResolveUnknownID(t *testing.T) {
 func TestResolveIsOneShot(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	id, _, err := h.b.pushEvent("q")
+	id, _, err := h.b.pushEvent("q", "")
 	if err != nil {
 		t.Fatalf("pushEvent: %v", err)
 	}
@@ -230,7 +236,7 @@ func TestResolveConcurrent(t *testing.T) {
 	ids := make([]string, 0, n)
 	sinks := make(map[string]chan string, n)
 	for range n {
-		id, sink, err := h.b.pushEvent("q")
+		id, sink, err := h.b.pushEvent("q", "")
 		if err != nil {
 			t.Fatalf("pushEvent: %v", err)
 		}
@@ -273,7 +279,7 @@ func TestReplyToolOutcomes(t *testing.T) {
 	t.Run("delivers", func(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t)
-		id, sink, err := h.b.pushEvent("q")
+		id, sink, err := h.b.pushEvent("q", "")
 		if err != nil {
 			t.Fatalf("pushEvent: %v", err)
 		}
@@ -295,7 +301,7 @@ func TestReplyToolOutcomes(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t)
 		for range 2 {
-			if _, _, err := h.b.pushEvent("q"); err != nil {
+			if _, _, err := h.b.pushEvent("q", ""); err != nil {
 				t.Fatalf("pushEvent: %v", err)
 			}
 		}
@@ -605,5 +611,65 @@ func TestConcurrentCallersDoNotCrossTalk(t *testing.T) {
 			t.Errorf("two callers received the same answer %q", r.resp.Reply)
 		}
 		seen[r.resp.Reply] = true
+	}
+}
+
+func TestPushEventCarriesTheThreadID(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	if _, _, err := h.b.pushEvent("q", "T-42"); err != nil {
+		t.Fatalf("pushEvent: %v", err)
+	}
+	params, _ := h.notifications(t)[0]["params"].(map[string]any)
+	meta, _ := params["meta"].(map[string]any)
+
+	// Without this, ask_amp can only guess "whichever thread messaged us last",
+	// which routes to the wrong thread when two Amp threads share one session.
+	if meta["thread_id"] != "T-42" {
+		t.Errorf("meta.thread_id = %v, want T-42", meta["thread_id"])
+	}
+}
+
+func TestPushEventOmitsAnUnknownThreadID(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	if _, _, err := h.b.pushEvent("q", ""); err != nil {
+		t.Fatalf("pushEvent: %v", err)
+	}
+	params, _ := h.notifications(t)[0]["params"].(map[string]any)
+	meta, _ := params["meta"].(map[string]any)
+	if _, ok := meta["thread_id"]; ok {
+		t.Error("an empty thread_id must be omitted, not sent as a blank attribute")
+	}
+}
+
+// failWriter fails every write, standing in for a broken stdout.
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errWriteFailed }
+
+var errWriteFailed = errors.New("stdout is gone")
+
+func TestPushEventUnwindsWhenTheEventCannotBeDelivered(t *testing.T) {
+	t.Parallel()
+	lg := &syncBuf{}
+	b := newBridge(testConfig(), failWriter{}, lg)
+
+	_, _, err := b.pushEvent("nobody will see this", "")
+	if err == nil {
+		t.Fatal("a failed send must be reported, not swallowed")
+	}
+	// Otherwise the caller blocks for the full timeout waiting on a message
+	// Claude was never given.
+	if n := b.pendingCount(); n != 0 {
+		t.Errorf("pendingCount = %d, want 0 — the slot leaked", n)
+	}
+	if !strings.Contains(lg.String(), "EVENT_PUSH_FAILED") {
+		t.Error("the delivery failure should be logged")
+	}
+	if strings.Contains(lg.String(), "EVENT_PUSHED") {
+		t.Error("EVENT_PUSHED must not be logged for an event that never went out")
 	}
 }

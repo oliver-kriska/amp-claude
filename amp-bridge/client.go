@@ -15,7 +15,11 @@ import (
 // bridge over its Unix socket.
 
 func cmdList() int {
-	bridges := listBridges()
+	bridges, err := listBridges()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "amp-bridge: %v\n", err)
+		return 2
+	}
 	if len(bridges) == 0 {
 		fmt.Println("no live amp-bridge sessions")
 		return 1
@@ -27,7 +31,10 @@ func cmdList() int {
 }
 
 func pickBridge(want string) (registryEntry, error) {
-	bridges := listBridges()
+	bridges, err := listBridges()
+	if err != nil {
+		return registryEntry{}, err
+	}
 	if len(bridges) == 0 {
 		return registryEntry{}, errors.New(
 			"no live amp-bridge sessions.\n" +

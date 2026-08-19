@@ -72,7 +72,9 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 	b.askMu.Lock()
 	defer b.askMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), b.cfg.ampTimeout)
+	// Derived from the bridge context, not Background: on shutdown the Amp
+	// subprocess must die with us rather than linger as an orphan.
+	ctx, cancel := context.WithTimeout(b.ctx, b.cfg.ampTimeout)
 	defer cancel()
 
 	// #nosec G204 -- the binary is operator-configured (AMP_BIN) and the
@@ -90,6 +92,9 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return out, fmt.Errorf("amp timed out after %s", b.cfg.ampTimeout)
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return out, errors.New("bridge is shutting down; the Amp turn was cancelled")
 	}
 	if err != nil {
 		if errOut != "" {

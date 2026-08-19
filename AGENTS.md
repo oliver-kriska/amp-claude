@@ -36,8 +36,11 @@ first** — it names the live sessions and confirms the channel is loaded. If
 exactly one session is live, `--session` is optional.
 
 Pass `--thread` with your own Amp thread id when you want Claude to be able to
-call `ask_amp` back into *this* thread. The bridge remembers the last thread id
-it saw.
+call `ask_amp` back into *this* thread. The id rides along on the event Claude
+receives (as a `thread_id` attribute on the `<channel>` tag), so Claude can
+address the right thread even when several are talking to one session. Without
+it the bridge falls back to whichever thread messaged it last — fine for a single
+thread, wrong as soon as there are two.
 
 ## Timing
 
@@ -64,6 +67,12 @@ All are env-tunable (`AMP_BRIDGE_MAX_INFLIGHT`, `AMP_BRIDGE_MAX_BYTES`,
 someone's session. Raise them deliberately, not reflexively.
 
 ## Failure triage
+
+Start with `amp-bridge doctor`. It checks the binary, `.mcp.json`, the runtime
+directory, live sessions, the Amp CLI and the log, prints the fix for anything
+broken, and exits non-zero if a check actually failed. It is faster than reading
+the table below and it catches the case the table cannot: a `.mcp.json` pointing
+at a stale build, where everything reports healthy and nothing is delivered.
 
 | Exit / message | Meaning |
 |---|---|
@@ -105,10 +114,14 @@ reports the active versions and warns if they have drifted from the pins.
 ```bash
 mise install           # once, at the repo root
 cd amp-bridge
-make build             # rm-then-build: overwriting a Mach-O breaks its macOS signature
-make install           # copy to ~/.local/bin (PREFIX= to change)
+make setup             # build + install to ~/.local/bin + register in ../.mcp.json
 make check             # tidy, format, vet, lint, and both test tiers — the gate
 ```
+
+`make setup` is build, install and `amp-bridge init` in one step; the pieces are
+still available separately as `make build` / `make install` / `make doctor`.
+`make setup PROJECT=~/somewhere` registers the bridge in a different project's
+`.mcp.json` instead of this repo's.
 
 **The module has no dependencies and must not gain one.** `make outdated` will
 always be empty. An MCP SDK would implement `server/discover`, which wins the
