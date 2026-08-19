@@ -91,6 +91,11 @@ type bridge struct {
 	restartMax     int
 	restartWindow  time.Duration
 	restartBackoff time.Duration
+	socketCheck    time.Duration
+
+	// Amp turns are serialised: two concurrent `threads continue` runs against
+	// one thread would interleave writes to the same conversation.
+	askMu sync.Mutex
 }
 
 func (b *bridge) listener() net.Listener {
@@ -134,6 +139,7 @@ func newBridge(cfg config, out, logw io.Writer) *bridge {
 		restartMax:     5,
 		restartWindow:  time.Minute,
 		restartBackoff: 100 * time.Millisecond,
+		socketCheck:    5 * time.Second,
 	}
 }
 
@@ -231,7 +237,17 @@ func (b *bridge) dispatch(msg rpc) {
 		b.reply(msg.ID, map[string]any{"tools": []any{replyTool, askAmpTool}})
 
 	case "tools/call":
-		b.handleToolsCall(msg)
+		// Off the read loop. ask_amp shells out to the Amp CLI for up to five
+		// minutes; handling it inline stalls the whole transport — no ping, no
+		// reply from Claude, not even stdin EOF noticed. JSON-RPC correlates by
+		// id and send is mutex-guarded, so answering out of order is fine.
+		go func() {
+			if panicked := b.guard("tools/call", func() { b.handleToolsCall(msg) }); panicked {
+				if len(msg.ID) > 0 {
+					b.fail(msg.ID, errInternal, "internal error handling tools/call")
+				}
+			}
+		}()
 
 	case "ping":
 		b.reply(msg.ID, map[string]any{})
@@ -308,6 +324,12 @@ func (b *bridge) handleReply(id, args json.RawMessage) {
 	}
 	if err := decodeArgs(args, &a); err != nil {
 		b.fail(id, errInvalidParams, "invalid reply arguments: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(a.Text) == "" {
+		b.reply(id, toolResult("text is empty — Amp would receive a blank answer. "+
+			"Send the actual reply body.", true))
 		return
 	}
 

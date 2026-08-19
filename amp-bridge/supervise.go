@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net"
+	"os"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -72,13 +74,7 @@ func (r *restartBudget) allow(now time.Time) bool {
 	return true
 }
 
-// superviseSocket keeps the Amp listener alive.
-//
-// serveSocket returns when Accept fails, which for a Unix socket means the
-// listener is gone: deliberately at shutdown, or because something removed the
-// socket file underneath us — a /tmp sweeper is the realistic case. Without this
-// the process would keep running as a healthy-looking bridge that Amp can never
-// dial again, and nothing would say so.
+// superviseSocket keeps the Amp listener alive and the socket path reachable.
 func (b *bridge) superviseSocket(sock string) {
 	budget := &restartBudget{max: b.restartMax, window: b.restartWindow}
 	backoff := b.restartBackoff
@@ -89,11 +85,20 @@ func (b *bridge) superviseSocket(sock string) {
 		if ln == nil {
 			return
 		}
-		b.guard("socket accept loop", func() { b.serveSocket(ln) })
+		b.watchAndServe(sock, ln)
 
 		if b.shuttingDown() {
 			return
 		}
+
+		// Free the old descriptor before rebinding. Accept can fail on a
+		// transient error (EMFILE) while the listener itself is still bound;
+		// leaving it open makes bindSocket's liveness probe dial *us*, conclude
+		// another bridge owns the path, and refuse to "hijack" it — which would
+		// burn the entire restart budget on a fault that was recoverable, while
+		// blaming a process that does not exist.
+		_ = ln.Close()
+
 		if !budget.allow(time.Now()) {
 			b.logf("SOCKET_SUPERVISOR_EXHAUSTED %d restarts within %s — the fault is not "+
 				"transient; exiting so it is visible rather than silent", budget.max, budget.window)
@@ -102,8 +107,13 @@ func (b *bridge) superviseSocket(sock string) {
 		}
 
 		time.Sleep(backoff)
-		if backoff < maxBackoff {
-			backoff *= 2
+		if backoff = 2 * backoff; backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+		// cleanup may have run while we slept; rebinding now would recreate the
+		// socket file microseconds before exit and orphan it.
+		if b.shuttingDown() {
+			return
 		}
 
 		newLn, err := bindSocket(sock)
@@ -114,5 +124,41 @@ func (b *bridge) superviseSocket(sock string) {
 		b.setListener(newLn)
 		b.logf("SOCKET_REBOUND %s — Amp can reach us again", sock)
 		backoff = b.restartBackoff
+	}
+}
+
+// watchAndServe runs the accept loop while watching the socket path.
+//
+// This watchdog exists because of a Unix detail that is easy to get wrong:
+// unlinking a socket path does NOT make Accept fail. The listener holds the
+// inode, so it stays blocked indefinitely while every new dial gets ENOENT.
+// Verified on Go 1.26.6/macOS: after os.Remove, Accept was still blocked after
+// two seconds. That is precisely the /tmp-sweeper failure, and watching for
+// Accept to return could never detect it. Closing the listener ourselves is what
+// unblocks Accept and hands control back to the restart loop.
+func (b *bridge) watchAndServe(sock string, ln net.Listener) {
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		b.guard("socket accept loop", func() { b.serveSocket(ln) })
+	}()
+
+	ticker := time.NewTicker(b.socketCheck)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-served:
+			return
+		case <-ticker.C:
+			if b.shuttingDown() {
+				continue
+			}
+			if _, err := os.Lstat(sock); err != nil {
+				b.logf("SOCKET_FILE_LOST %s (%v) — closing the listener to force a rebind",
+					sock, err)
+				_ = ln.Close() // unblocks Accept; serveSocket returns
+			}
+		}
 	}
 }

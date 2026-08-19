@@ -773,13 +773,81 @@ reconnection"*, but whether it respawns a dead stdio MCP server has never been
 tested. A fail-fast design would have been betting the bridge's availability on
 that. Self-healing works either way, and still exits when the fault is permanent.
 
-### Realistic trigger
+### Realistic trigger — and the reason the first attempt could not detect it
 
-Not a hypothetical. The socket lives under `/tmp`, which macOS periodically
-sweeps. Losing the path leaves exactly the silent-degradation state above.
+The socket lives under `/tmp`, which macOS periodically sweeps. Losing the path
+leaves exactly the silent-degradation state above.
 
-85 tests, 78.7% coverage. The supervision tests cover rebind-after-loss, silence
-on deliberate shutdown, escalation when every rebind fails, and panic containment.
+**The first implementation could never fire on it.** It watched for `Accept` to
+return, on the assumption that losing the socket file would fail the accept loop.
+It does not. A Unix listener holds the *inode*; unlinking the path leaves `Accept`
+blocked indefinitely while every new dial gets `ENOENT`. Verified directly on
+Go 1.26.6 / macOS: after `os.Remove(sock)`, `Accept` was still blocked two
+seconds later.
+
+Worse, the test passed. It simulated the sweeper with `ln.Close()` — which
+unlinks the path as a side effect — so it exercised a completely different
+failure. The watchdog could have been absent and the suite would still have been
+green.
+
+The fix is an explicit path watchdog: poll `Lstat(sock)` alongside the accept
+loop and, when the path is gone, close the listener ourselves to unblock `Accept`
+and hand control to the restart loop. See §16.
+
+---
+
+## 16. External review (rev. 10)
+
+A full adversarial review by a separate agent on a different model, briefed with
+the four load-bearing constraints so it would not "helpfully" recommend an MCP
+SDK. No critical findings; six confirmed defects, all now fixed.
+
+| # | Severity | Defect |
+|---|---|---|
+| 1 | high | The socket watchdog watched the wrong signal — unlinking a socket does not fail `Accept`, so the sweeper case it existed for could never trigger it. Its test modelled the sweeper as `ln.Close()` and so passed regardless. |
+| 2 | med-high | `tools/call` was handled on the read loop, so `ask_amp` stalled the entire transport for up to 5 minutes — no ping, no `reply`, not even stdin EOF noticed. |
+| 3 | medium | `ensureRuntimeDir` did MkdirAll → Chmod → symlink check. Both mutating calls follow symlinks, so the refusal came *after* chmod 0700 had been applied to an attacker-chosen directory. |
+| 4 | med-low | The supervisor never closed the old listener before rebinding, so `bindSocket`'s liveness probe dialled *our own* listener, concluded another bridge owned the path, and refused to hijack it — burning the whole budget and blaming a process that did not exist. |
+| 5 | low-med | At the deadline boundary Claude could be told "delivered" while Amp was told "timed out", losing the answer in between. |
+| 6 | low | `AGENTS.md` documented a triage message the Amp side can never observe — the `request_id is required` guard reports to Claude, not to the caller. |
+
+### What the two highest findings have in common
+
+Both are *tests that could not fail*. Finding 1's watchdog test passed with the
+watchdog removed; a first attempt at finding 2's regression test started its
+clock after the blocking call returned, so it also passed against the unfixed
+code. Both were caught by mutation-checking: break the fix, confirm the test goes
+red, restore. Any test written to pin a subtle concurrency or syscall behaviour
+should be mutation-checked before it is trusted — otherwise it is documentation,
+not verification.
+
+### Also changed
+
+`ask_amp` turns are now serialised (concurrent `threads continue` runs against
+one thread would interleave writes into a single conversation), thread ids are
+validated so a leading `-` cannot be read as a CLI flag, an empty `reply` text is
+rejected rather than delivered as a blank answer, and the supervisor re-checks
+for shutdown after its backoff sleep so it cannot recreate the socket file
+microseconds before exit.
+
+89 tests, 78.5% coverage.
+
+### Deferred, with reasons
+
+- **Registry published before the handshake completes.** A very fast `--ask` in
+  that window pushes an event Claude may drop, costing the caller a full timeout.
+  Real, but the fix couples registry publication to `notifications/initialized`;
+  worth doing deliberately rather than as a review sweep.
+- **No connection cap or idle deadline on the socket.** An idle local client
+  holds a goroutine and an fd indefinitely, and the JSON decoder buffers a large
+  payload before the size check sees it. Same-uid exposure only.
+- **Empty-`request_id` fallback can misroute across a timeout boundary.** If A
+  times out and B becomes the only pending request, a belated id-less answer to A
+  is delivered to B. Requires Claude to violate its own tool schema, which is why
+  the fallback exists at all.
+- **Client read deadline uses the *client's* `AMP_BRIDGE_TIMEOUT`.** A server
+  started with a longer timeout than the client's environment produces
+  `no reply: i/o timeout`, which reads as a dead socket.
 
 ---
 
@@ -807,7 +875,7 @@ filesystem state, the `SendMessage` tool contract, and `--help` output. Minified
 traced by hand. Claims resting on a single decompiled expression rather than observed behaviour are
 marked as such. No live-session messaging was performed.
 
-**Changelog.** Rev. 9: added §15 — ported OTP supervision to the Go bridge after live testing of ask_amp; added panic containment (`guard`), listener supervision with rebind, and a bounded restart budget that escalates by exiting rather than retrying forever; declined the GenServer-for-state translation with reasoning. Rev. 8: added §14 — removed the superseded Python probe, the `AMP_BRIDGE_PROTOCOL` escape hatch (built on the wrong reading of the era trap) and other dead code; moved configuration out of package globals into a `config` struct so tests are hermetic; replaced the Python e2e harness with a two-tier Go suite (66 tests, `-race`, 77.7% coverage) after validating the refactor against the old harness; added `.golangci.yml` (29 linters) and a `make check` gate. Rev. 3: added §10 — built and ran an instrumented probe server; captured Claude's real
+**Changelog.** Rev. 10: added §16 — external adversarial review; fixed six confirmed defects, the worst being that the socket watchdog watched a signal that can never fire (unlinking a Unix socket does not fail Accept) and its test simulated the wrong failure; corrected the §15 rationale accordingly. Rev. 9: added §15 — ported OTP supervision to the Go bridge after live testing of ask_amp; added panic containment (`guard`), listener supervision with rebind, and a bounded restart budget that escalates by exiting rather than retrying forever; declined the GenServer-for-state translation with reasoning. Rev. 8: added §14 — removed the superseded Python probe, the `AMP_BRIDGE_PROTOCOL` escape hatch (built on the wrong reading of the era trap) and other dead code; moved configuration out of package globals into a `config` struct so tests are hermetic; replaced the Python e2e harness with a two-tier Go suite (66 tests, `-race`, 77.7% coverage) after validating the refactor against the old harness; added `.golangci.yml` (29 linters) and a `make check` gate. Rev. 3: added §10 — built and ran an instrumented probe server; captured Claude's real
 MCP handshake (`2025-11-25`, modern era), confirmed the era trap and the `not-in-era` mechanism, pinned
 the channel payload fields, resolved account eligibility (policy-blocked on `claude_max`), and found
 the `--scope local` clobber. Rev. 2: added §6 Channels (missed in rev. 1 — caught by the Amp-side research);

@@ -73,6 +73,24 @@ If it buys neither, use shared memory and a mutex.** Same reasoning as
 "Mix task, not GenServer" call — OTP machinery with zero concurrency benefit is
 just complexity.
 
+## Watch the signal that actually fires
+
+A supervisor is only as good as its failure detector, and the detector is the
+easy part to get wrong.
+
+**Unlinking a Unix socket path does not make `Accept` fail.** The listener holds
+the inode, so it stays blocked indefinitely while every new `Dial` gets `ENOENT`.
+Verified on Go 1.26.6 / macOS: `Accept` was still blocked two seconds after
+`os.Remove`. Any supervisor that restarts "when the accept loop returns" is blind
+to the most likely real-world cause of a lost socket — a `/tmp` sweeper. Poll the
+path and close the listener yourself to unblock `Accept`.
+
+**Mutation-check any test that pins concurrency or syscall behaviour.** The test
+for the above passed with the watchdog deleted, because it simulated the sweeper
+with `ln.Close()` — which unlinks the path as a side effect and therefore
+exercised a different failure. Break the fix, confirm the test goes red, restore.
+A test that cannot fail is documentation, not verification.
+
 ## Choosing self-heal vs. let-it-crash
 
 "Let it crash" assumes a supervisor exists. Before designing around one, verify

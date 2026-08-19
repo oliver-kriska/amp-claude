@@ -225,9 +225,19 @@ func (b *bridge) awaitReply(id string, sink chan string, gone <-chan struct{}, r
 		respond(ampResponse{RequestID: id, Reply: r})
 		b.logf("AMP_REPLIED request_id=%s", id)
 	case <-timer.C:
+		// drop takes the same lock resolve holds while it buffers into sink, so
+		// once it returns any delivery that won the race is already visible.
+		// Without this re-check Claude is told "delivered" while Amp is told
+		// "timed out", and the answer is lost in between.
 		b.drop(id)
-		respond(ampResponse{RequestID: id, Error: "timed out waiting for Claude"})
-		b.logf("AMP_TIMEOUT request_id=%s", id)
+		select {
+		case r := <-sink:
+			respond(ampResponse{RequestID: id, Reply: r})
+			b.logf("AMP_REPLIED request_id=%s (arrived at the deadline)", id)
+		default:
+			respond(ampResponse{RequestID: id, Error: "timed out waiting for Claude"})
+			b.logf("AMP_TIMEOUT request_id=%s", id)
+		}
 	case <-gone:
 		b.drop(id)
 		b.logf("AMP_ABANDONED request_id=%s (caller disconnected)", id)

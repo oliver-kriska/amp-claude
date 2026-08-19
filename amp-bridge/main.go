@@ -60,7 +60,7 @@ Environment:
   AMP_BRIDGE_MAX_BYTES      max bytes per message            (default 65536)
   AMP_BRIDGE_TIMEOUT        how long a caller waits          (default 3m0s)
   AMP_BRIDGE_AMP_TIMEOUT    how long ask_amp waits           (default 5m0s)
-  AMP_BRIDGE_LOG            log file path (default ~/.local/state/amp-bridge/)
+  AMP_BRIDGE_LOG            log file (default ~/.local/state/amp-bridge/amp-bridge.log)
   AMP_BRIDGE_LOG_BODIES     1 to log frame bodies (contains conversation text)
   AMP_BRIDGE_DIR            runtime/registry directory
   AMP_BRIDGE_SOCKET         explicit socket path

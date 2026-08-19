@@ -300,3 +300,67 @@ func TestListBridgesIgnoresJunkFiles(t *testing.T) {
 		t.Errorf("listBridges = %+v, want none", got)
 	}
 }
+
+func TestEnsureRuntimeDirDoesNotTouchASymlinkTarget(t *testing.T) {
+	base := shortTempDir(t)
+	victim := filepath.Join(base, "victim")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(victim, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	t.Setenv("AMP_BRIDGE_DIR", link)
+
+	if _, err := ensureRuntimeDir(); err == nil {
+		t.Fatal("a symlinked runtime dir must be refused")
+	}
+
+	// Refusing is not enough. /tmp is world-writable, so another local user can
+	// pre-create our directory name as a symlink to a directory of theirs
+	// choosing. Chmod follows symlinks, so checking after mutating would already
+	// have re-permissioned someone else's directory.
+	fi, err := os.Stat(victim)
+	if err != nil {
+		t.Fatalf("stat victim: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o755 {
+		t.Errorf("symlink target mode changed to %o — the check ran after the side effect", perm)
+	}
+}
+
+func TestEnsureRuntimeDirRefusesADanglingSymlink(t *testing.T) {
+	base := shortTempDir(t)
+	target := filepath.Join(base, "does-not-exist")
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	t.Setenv("AMP_BRIDGE_DIR", link)
+
+	// mkdir(2) does not follow a symlink in the final component, so this must
+	// fail rather than quietly creating an attacker-chosen directory.
+	if _, err := ensureRuntimeDir(); err == nil {
+		t.Fatal("a dangling symlink must be refused, not followed")
+	}
+	if _, err := os.Stat(target); err == nil {
+		t.Error("the symlink target was created — mkdir followed the link")
+	}
+}
+
+func TestEnsureRuntimeDirRefusesANonDirectory(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "afile")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("AMP_BRIDGE_DIR", path)
+
+	if _, err := ensureRuntimeDir(); err == nil {
+		t.Error("a plain file in place of the runtime dir must be refused")
+	}
+}

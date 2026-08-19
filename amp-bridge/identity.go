@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -53,23 +54,38 @@ func runtimeDir() string {
 	return fmt.Sprintf("/tmp/amp-bridge-%d", os.Getuid())
 }
 
+// ensureRuntimeDir creates the per-uid runtime directory, refusing a symlink.
+//
+// Order matters. /tmp is world-writable, so another local user can pre-create
+// our directory name as a symlink pointing anywhere. MkdirAll and Chmod both
+// follow symlinks, so checking afterwards is too late: by then we have already
+// chmod'ed 0700 onto a directory of the attacker's choosing. Inspect first,
+// mutate second, and use Mkdir rather than MkdirAll — mkdir(2) does not follow a
+// symlink in the final path component, so a dangling link fails with EEXIST
+// instead of creating the target.
 func ensureRuntimeDir() (string, error) {
 	dir := runtimeDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+
+	fi, err := os.Lstat(dir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if mkErr := os.Mkdir(dir, 0o700); mkErr != nil {
+			return "", fmt.Errorf("create runtime dir %s: %w", dir, mkErr)
+		}
+		return dir, nil
+	case err != nil:
 		return "", err
+	case fi.Mode()&os.ModeSymlink != 0:
+		return "", fmt.Errorf("runtime dir %s is a symlink — refusing to use it", dir)
+	case !fi.IsDir():
+		return "", fmt.Errorf("runtime dir %s exists but is not a directory", dir)
 	}
-	// Re-assert perms in case the directory predates us.
+
+	// Re-assert perms in case the directory predates us and was looser.
 	// #nosec G302 -- 0700 is the tightest mode a directory can have and still
 	// be traversable; the socket and registry inside it are 0600.
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return "", err
-	}
-	fi, err := os.Lstat(dir)
-	if err != nil {
-		return "", err
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("runtime dir %s is a symlink — refusing to use it", dir)
 	}
 	return dir, nil
 }

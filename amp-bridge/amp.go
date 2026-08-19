@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 )
 
@@ -27,6 +28,10 @@ var (
 		"no Amp thread id known. Either the Amp side has not sent a message yet " +
 			"(the bridge learns the id from `--thread`), or you must pass thread_id explicitly")
 	errEmptyText = errors.New("text is empty")
+
+	// Amp thread ids look like T-01a01877-2274-734d-8306-7c37b33f2a7f. Anything
+	// starting with a dash would be read by the CLI as a flag rather than an id.
+	threadIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
 
 func (b *bridge) rememberThread(id string) {
@@ -55,9 +60,17 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 	if threadID == "" {
 		return "", errNoThread
 	}
+	if !threadIDRE.MatchString(threadID) {
+		return "", fmt.Errorf("implausible Amp thread id %q", threadID)
+	}
 	if strings.TrimSpace(text) == "" {
 		return "", errEmptyText
 	}
+
+	// One Amp turn at a time: concurrent `threads continue` runs against the
+	// same thread would interleave writes into one conversation.
+	b.askMu.Lock()
+	defer b.askMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), b.cfg.ampTimeout)
 	defer cancel()

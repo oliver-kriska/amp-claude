@@ -72,7 +72,6 @@ func superviseHarness(t *testing.T) (*harness, string) {
 	h := newHarness(t)
 	h.b.restartMax = 3
 	h.b.restartWindow = time.Minute
-	h.b.restartBackoff = 5 * time.Millisecond
 
 	ln, err := bindSocket(sock)
 	if err != nil {
@@ -89,21 +88,30 @@ func superviseHarness(t *testing.T) (*harness, string) {
 	return h, sock
 }
 
-func TestSupervisorRebindsALostListener(t *testing.T) {
+// TestSupervisorRebindsASweptSocket is the regression test that matters.
+//
+// Unlinking the socket path does NOT make Accept fail — the listener keeps the
+// inode and stays blocked, while every new dial gets ENOENT. An earlier version
+// of this test simulated the sweeper with ln.Close(), which unlinks the path as
+// a side effect, and so exercised the wrong failure entirely: the watchdog could
+// have been absent and it would still have passed.
+func TestSupervisorRebindsASweptSocket(t *testing.T) {
 	t.Parallel()
 	h, sock := superviseHarness(t)
 
-	// Prove it works, then destroy the listener the way a stray close or a
-	// /tmp sweeper would — without announcing a shutdown.
 	conn := dialBridge(t, sock)
 	if err := json.NewEncoder(conn).Encode(ampRequest{Text: "before"}); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	waitFor(t, "the first event", func() bool { return len(h.notifications(t)) == 1 })
 
-	if l := h.b.listener(); l != nil {
-		_ = l.Close()
+	// Exactly what a /tmp sweeper does, and nothing else.
+	if err := os.Remove(sock); err != nil {
+		t.Fatalf("remove socket: %v", err)
 	}
+	waitFor(t, "the sweep to be noticed", func() bool {
+		return strings.Contains(h.log.String(), "SOCKET_FILE_LOST")
+	})
 
 	waitFor(t, "the socket to be rebound", func() bool {
 		return strings.Contains(h.log.String(), "SOCKET_REBOUND")
@@ -208,4 +216,36 @@ func ensureDir(t *testing.T, dir string) error {
 func removeAll(t *testing.T, dir string) error {
 	t.Helper()
 	return os.RemoveAll(dir)
+}
+
+// TestTransportStaysResponsiveDuringASlowToolCall guards finding 2: ask_amp can
+// run for minutes, and answering it on the read loop stalled the entire
+// transport — no ping, no reply from Claude, not even stdin EOF noticed.
+func TestTransportStaysResponsiveDuringASlowToolCall(t *testing.T) {
+	t.Parallel()
+	h := ampHarness(t, `sleep 2; echo done`)
+
+	// Start the clock BEFORE dispatching: the whole point is that neither the
+	// dispatch nor the ping may wait for the 2s Amp turn. Timing the ping alone
+	// would pass even with a fully serialised transport, because handle() would
+	// already have blocked before the clock started.
+	start := time.Now()
+	h.call(t, map[string]any{
+		"jsonrpc": "2.0", "id": "slow", "method": "tools/call",
+		"params": map[string]any{
+			"name":      toolAskAmp,
+			"arguments": map[string]any{"text": "hello", "thread_id": "T-abc"},
+		},
+	})
+	if blocked := time.Since(start); blocked > 500*time.Millisecond {
+		t.Fatalf("dispatching a slow tool call held the read loop for %v", blocked)
+	}
+
+	h.call(t, map[string]any{"jsonrpc": "2.0", "id": "ping", "method": "ping"})
+	result(t, h.response(t, "ping"))
+	if waited := time.Since(start); waited > time.Second {
+		t.Errorf("ping answered only after %v — the transport is serialised behind ask_amp", waited)
+	}
+
+	result(t, h.response(t, "slow")) // and the slow call still completes
 }

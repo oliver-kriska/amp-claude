@@ -70,7 +70,7 @@ someone's session. Raise them deliberately, not reflexively.
 | `no live amp-bridge sessions` | No Claude session has the channel loaded — it must be started with `claude --dangerously-load-development-channels server:amp-bridge`. Nothing else will work until then. |
 | exit 2, `cannot reach <name> at <path>` | Registry entry exists but the socket is dead; the bridge process died. |
 | exit 1, `timed out waiting for Claude` | Socket fine, event delivered, but Claude never called `reply`. The interesting failure — report it rather than retrying blindly. |
-| exit 1, `request_id is required` | Concurrency guard fired; Claude replied without saying which question it was answering. |
+| exit 1, `timed out waiting for Claude` *after* Claude appeared to answer | Claude replied without a `request_id` while several requests were in flight. The bridge refuses to guess and tells Claude so; if Claude does not retry with the id, your call just times out. You never see the guard message itself — it goes to Claude, not to you. |
 | exit 137 | The binary was replaced with `cp`, invalidating its macOS code signature. Rebuild, don't work around it. |
 
 Server-side view: `~/.local/state/amp-bridge/amp-bridge.log` — look for `EVENT_PUSHED`,

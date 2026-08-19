@@ -54,7 +54,11 @@ func newHarness(t *testing.T, mutate ...func(*config)) *harness {
 		m(&cfg)
 	}
 	out, lg := &syncBuf{}, &syncBuf{}
-	return &harness{b: newBridge(cfg, out, lg), out: out, log: lg}
+	b := newBridge(cfg, out, lg)
+	// Supervision defaults are tuned for production; tests need them fast.
+	b.restartBackoff = 5 * time.Millisecond
+	b.socketCheck = 10 * time.Millisecond
+	return &harness{b: b, out: out, log: lg}
 }
 
 // frames decodes every JSON-RPC frame the bridge has written so far.
@@ -74,16 +78,24 @@ func (h *harness) frames(t *testing.T) []map[string]any {
 	return out
 }
 
-// response returns the single frame answering the given request id.
+// response returns the frame answering the given request id, waiting for it:
+// tool calls are answered off the read loop, so the reply may not be written by
+// the time handle() returns.
 func (h *harness) response(t *testing.T, id any) map[string]any {
 	t.Helper()
-	for _, f := range h.frames(t) {
-		if got := f["id"]; got != nil && equalJSON(got, id) {
-			return f
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		for _, f := range h.frames(t) {
+			if got := f["id"]; got != nil && equalJSON(got, id) {
+				return f
+			}
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no response with id %v in %s", id, h.out.String())
+			return nil
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("no response with id %v in %s", id, h.out.String())
-	return nil
 }
 
 // notifications returns every channel notification pushed so far.
