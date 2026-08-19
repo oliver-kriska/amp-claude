@@ -29,11 +29,40 @@ cd amp-bridge
 make setup                  # build, install to ~/.local/bin, register in .mcp.json
 ```
 
-`make setup` registers the bridge in the repo root's `.mcp.json`. To use it from
-another project instead:
+`make setup` registers the bridge in the repo root's `.mcp.json`, which is
+generated per machine and gitignored — it holds an absolute path, so it is never
+committed. To register in another project instead:
 
 ```bash
-make setup PROJECT=~/Projects/other-app
+make setup PROJECT=$HOME/Projects/other-app
+```
+
+### Using it in every project
+
+The binary is installed once, on PATH; only the *registration* is per project.
+To skip that and have the bridge available everywhere:
+
+```bash
+make setup-global
+```
+
+That does two things: `claude mcp add amp-bridge --scope user`, which registers
+the server in `~/.claude.json` for all projects rather than one, and copies the
+skill to `~/.claude/skills/amp-bridge/` so every session knows how to use it.
+No per-project `.mcp.json` is needed afterwards — `doctor` recognises the
+user-scope registration and stops asking for one.
+
+The channel flag is still required on every session; it is what loads channels
+at all, and there is no config file equivalent:
+
+```bash
+claude --dangerously-load-development-channels server:amp-bridge
+```
+
+A shell alias is the usual way to stop typing it:
+
+```bash
+alias claude-amp='claude --dangerously-load-development-channels server:amp-bridge'
 ```
 
 Then start Claude Code **with the channel flag** — this is the part that is easy
@@ -43,10 +72,11 @@ to miss, and without it nothing is delivered:
 claude --dangerously-load-development-channels server:amp-bridge
 ```
 
-Verify:
+Verify — note the directory, since `make setup` leaves you in `amp-bridge/` and
+the config it just wrote is one level up:
 
 ```bash
-amp-bridge doctor
+make doctor          # or: amp-bridge doctor ..
 ```
 
 ```
@@ -58,9 +88,19 @@ amp-bridge doctor
   [ok  ] log             ~/.local/state/amp-bridge/amp-bridge.log (last write 9s ago)
 ```
 
-`doctor` exits non-zero if anything is actually broken, and every failure line
-carries the command that fixes it. Run it first whenever the bridge seems dead —
-the failure modes here are quiet ones, and it is built to name them out loud.
+Every failure line carries the command that fixes it. Run `doctor` first whenever
+the bridge seems dead — the failure modes here are quiet ones, and it is built to
+name them out loud.
+
+It distinguishes three states. `FAIL` is something broken and exits non-zero.
+`warn` is a state you may be in on purpose — no session started yet is the
+expected result of a pre-flight check — and exits 0. To gate on full operational
+readiness, `amp-bridge doctor --strict` treats warnings as failures too.
+
+`doctor` compares against reality rather than configuration: it executes the
+configured binary, and it compares the build fingerprint of each live session
+against the installed one, so "installed but never restarted" is reported rather
+than passing as green.
 
 ## Use it
 

@@ -105,9 +105,33 @@ type bridge struct {
 	cancelCtx context.CancelFunc
 	toolWG    sync.WaitGroup
 
-	// Registry entry, republished by the watchdog if it is swept.
+	// Registry entry, republished by the watchdog if it is swept. Guarded
+	// because the read loop stamps initialized_at onto it while the supervisor
+	// goroutine may be republishing it.
+	regMu   sync.Mutex
 	reg     registryEntry
 	regPath string
+}
+
+// markInitialized records that Claude completed the MCP handshake.
+//
+// This is the only positive evidence that the channel is registered rather than
+// the process merely being alive, and putting it in the registry makes it
+// per-session and per-run. The alternative — grepping an append-only log for a
+// marker — is satisfied forever by a line written years ago.
+func (b *bridge) markInitialized() {
+	b.regMu.Lock()
+	if b.regPath == "" {
+		b.regMu.Unlock()
+		return
+	}
+	b.reg.InitializedAt = time.Now().UTC().Format(time.RFC3339)
+	entry := b.reg
+	b.regMu.Unlock()
+
+	if _, err := entry.publish(); err != nil {
+		b.logf("REGISTRY_UPDATE_FAILED %v", err)
+	}
 }
 
 func (b *bridge) listener() net.Listener {
@@ -263,6 +287,7 @@ func (b *bridge) dispatch(msg rpc) {
 
 	case "notifications/initialized":
 		b.logf("CLIENT_INITIALIZED — channel listener should now be registered")
+		b.markInitialized()
 
 	case "tools/list":
 		b.reply(msg.ID, map[string]any{"tools": []any{replyTool, askAmpTool}})

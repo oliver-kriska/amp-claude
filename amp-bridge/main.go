@@ -51,13 +51,14 @@ type options struct {
 	thread  string
 	text    string
 	dir     string
+	strict  bool
 }
 
 const usage = `amp-bridge — bridge an Amp thread to a Claude Code session
 
   amp-bridge                            run as an MCP stdio server (Claude spawns this)
   amp-bridge init [dir]                 write .mcp.json pointing at this binary
-  amp-bridge doctor [dir]               diagnose why the channel is not working
+  amp-bridge doctor [dir] [--strict]    diagnose why the channel is not working
   amp-bridge --list                     list live bridges
   amp-bridge [--session N] [--thread T] --ask "text"
 
@@ -130,14 +131,32 @@ func parseSubcommand(args []string) (options, bool) {
 	default:
 		return options{}, false
 	}
-	if len(args) >= 2 {
-		o.dir = args[1]
+	for _, a := range args[1:] {
+		if a == "--strict" {
+			o.strict = true
+			continue
+		}
+		o.dir = a
 	}
 	return o, true
 }
 
+// subcommandError rejects a shape it does not understand rather than silently
+// using the last directory it saw: a typo'd flag that looks like a no-op is the
+// failure mode this whole binary keeps designing against.
 func subcommandError(args []string) error {
-	if len(args) > 2 {
+	dirs := 0
+	for _, a := range args[1:] {
+		switch {
+		case a == "--strict" && args[0] == "doctor":
+			continue
+		case strings.HasPrefix(a, "-"):
+			return fmt.Errorf("%s does not take %s", args[0], a)
+		default:
+			dirs++
+		}
+	}
+	if dirs > 1 {
 		return fmt.Errorf("%s takes at most one directory", args[0])
 	}
 	return nil
@@ -166,7 +185,7 @@ func run(args []string) int {
 	case modeInit:
 		return cmdInit(opts.dir)
 	case modeDoctor:
-		return cmdDoctor(cfg, opts.dir)
+		return cmdDoctor(cfg, opts.dir, opts.strict)
 	case modeServe:
 		return runServer(cfg)
 	default:
@@ -248,7 +267,9 @@ func runServer(cfg config) int {
 		fmt.Fprintf(os.Stderr, "amp-bridge: cannot publish registry entry: %v\n", err)
 		return 1
 	}
+	b.regMu.Lock()
 	b.reg, b.regPath = entry, regPath
+	b.regMu.Unlock()
 
 	b.logf("=== %s %s started name=%s pid=%d claude_pid=%d socket=%s bodies=%v ===",
 		serverName, serverVersion, name, os.Getpid(), entry.ClaudePID, sock, cfg.logBodies)

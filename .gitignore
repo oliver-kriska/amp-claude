@@ -1,3 +1,8 @@
 # Claude Code machine-local state: MCP server approvals and per-user settings.
 # Deliberately not shared — it records what this machine has consented to run.
 .claude/settings.local.json
+
+# Generated per machine by `amp-bridge init` (via `make setup`): it holds an
+# absolute path to the installed binary, so a committed copy is broken for
+# everyone else and drifts silently for you. See amp-bridge/init.go.
+.mcp.json

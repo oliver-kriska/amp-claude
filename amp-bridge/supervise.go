@@ -135,13 +135,17 @@ func (b *bridge) superviseSocket(sock string) {
 // mode this whole subsystem exists to eliminate. publish() recreates the runtime
 // directory too, so a wholesale sweep recovers.
 func (b *bridge) ensureRegistered() {
-	if b.regPath == "" {
+	b.regMu.Lock()
+	regPath, entry := b.regPath, b.reg
+	b.regMu.Unlock()
+
+	if regPath == "" {
 		return
 	}
-	if _, err := os.Lstat(b.regPath); err == nil {
+	if _, err := os.Lstat(regPath); err == nil {
 		return
 	}
-	path, err := b.reg.publish()
+	path, err := entry.publish()
 	if err != nil {
 		b.logf("REGISTRY_REPUBLISH_FAILED %v", err)
 		return

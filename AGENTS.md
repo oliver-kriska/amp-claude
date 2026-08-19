@@ -127,8 +127,12 @@ make check             # tidy, format, vet, lint, and both test tiers — the ga
 
 `make setup` is build, install and `amp-bridge init` in one step; the pieces are
 still available separately as `make build` / `make install` / `make doctor`.
-`make setup PROJECT=~/somewhere` registers the bridge in a different project's
-`.mcp.json` instead of this repo's.
+`make setup PROJECT=$HOME/somewhere` registers the bridge in a different
+project's `.mcp.json` instead of this repo's, and `make setup-global` registers
+it for every project at once (user-scope MCP entry plus the skill).
+
+`amp-bridge doctor --strict` treats warnings as failures, for use as a gate
+rather than a report.
 
 **The module has no dependencies and must not gain one.** `make outdated` will
 always be empty. An MCP SDK would implement `server/discover`, which wins the

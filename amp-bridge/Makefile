@@ -42,16 +42,30 @@ install: build ## Install to $(BINDIR) (override with PREFIX=/usr/local)
 
 # The directory whose .mcp.json gets the bridge. Defaults to the repo root, one
 # level up from this Makefile; point it at any project you want a bridge in:
-#   make setup PROJECT=~/Projects/other-app
+#   make setup PROJECT=$$HOME/Projects/other-app
+# Quoted at every use site, so a path with spaces works — but note that `~` is
+# expanded by the shell, not by make, so spell out $$HOME rather than using ~.
 PROJECT ?= $(CURDIR)/..
 
 .PHONY: setup
 setup: install ## Build, install, and register the bridge in $(PROJECT)/.mcp.json
-	@$(BINDIR)/$(BIN) init $(PROJECT)
+	@"$(BINDIR)/$(BIN)" init "$(PROJECT)"
+
+# Register for EVERY project instead of one: a user-scope MCP entry plus the
+# skill that teaches Claude how to use the bridge. Needs the `claude` CLI.
+.PHONY: setup-global
+setup-global: install ## Register the bridge and skill for all projects
+	@command -v claude >/dev/null || { echo "the claude CLI is not on PATH"; exit 1; }
+	claude mcp add $(BIN) --scope user -- "$(BINDIR)/$(BIN)"
+	mkdir -p "$(HOME)/.claude/skills/$(BIN)"
+	cp ../.claude/skills/$(BIN)/SKILL.md "$(HOME)/.claude/skills/$(BIN)/SKILL.md"
+	@echo
+	@echo "registered for all projects. Start any session with:"
+	@echo "  claude --dangerously-load-development-channels server:$(BIN)"
 
 .PHONY: doctor
 doctor: ## Diagnose the installed bridge against $(PROJECT)
-	@$(BINDIR)/$(BIN) doctor $(PROJECT)
+	@"$(BINDIR)/$(BIN)" doctor "$(PROJECT)"
 
 .PHONY: uninstall
 uninstall: ## Remove the installed binary
