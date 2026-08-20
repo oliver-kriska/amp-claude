@@ -128,7 +128,17 @@ func TestAskAmpErrors(t *testing.T) {
 
 	t.Run("timeout", func(t *testing.T) {
 		t.Parallel()
-		bin := fakeAmp(t, `sleep 30`)
+		// A bare `sleep 30` makes this test a coin toss on shell semantics: some
+		// /bin/sh exec-optimise the last command, so killing amp's pid kills the
+		// sleep and the wait is bounded by accident. That is why it passed on
+		// macOS and hung for the full 30s on CI.
+		//
+		// This script removes the shell from the question. amp exits immediately;
+		// a grandchild holds the inherited stdout pipe for 30 seconds. Wait
+		// cannot return until that pipe reaches EOF no matter who gets killed,
+		// so only an explicit bound gets us out — which is the real shape of the
+		// problem, amp being a Node CLI that spawns children.
+		bin := fakeAmp(t, "sh -c 'sleep 30' &\nexit 0")
 		h := newHarness(t, func(c *config) {
 			c.ampDisabled = false
 			c.ampBin = bin

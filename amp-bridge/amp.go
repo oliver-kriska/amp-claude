@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // Claude -> Amp direction.
@@ -21,6 +23,11 @@ import (
 // Thread identity: Amp's client may pass --thread <id>, which we remember. That
 // lets Claude say "ask Amp about X" without knowing the id, while still allowing
 // an explicit override.
+
+// ampWaitDelay bounds how long Wait may keep reading amp's pipes after the
+// context has been cancelled. Two seconds is generous for a child that is about
+// to die anyway and short enough that Claude's turn is not held on it.
+const ampWaitDelay = 2 * time.Second
 
 var (
 	errOutboundDisabled = errors.New(
@@ -127,18 +134,7 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 	if ampLog != "" {
 		args = append([]string{"--log-file", ampLog}, args...)
 	}
-	// #nosec G204 -- the binary is operator-configured (AMP_BIN) and the
-	// arguments are passed as an argv slice, never through a shell.
-	cmd := exec.CommandContext(ctx, b.cfg.ampBin, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	// Never inherit our stdin: that is the MCP transport.
-	cmd.Stdin = nil
-
-	err = cmd.Run()
-	out := strings.TrimSpace(stdout.String())
-	errOut := strings.TrimSpace(stderr.String())
+	out, errOut, err := runAmp(ctx, b.cfg.ampBin, args)
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return out, fmt.Errorf("amp timed out after %s", b.cfg.ampTimeout)
@@ -175,6 +171,41 @@ func (b *bridge) resolveThread(threadID string) (string, error) {
 		return "", fmt.Errorf("implausible Amp thread id %q", threadID)
 	}
 	return threadID, nil
+}
+
+// runAmp executes the Amp CLI under ctx and returns its trimmed output.
+//
+// The process-group handling is what makes a deadline on ctx mean anything.
+// Stdout is a bytes.Buffer, so os/exec hands amp a pipe and copies from it, and
+// Wait cannot return until that pipe reaches EOF — which needs every holder of
+// the write end to close it. amp is a Node CLI that spawns children, and they
+// inherit it. Killing amp alone leaves them holding the pipe, so Wait blocks for
+// as long as the longest-lived grandchild however short the timeout was. CI
+// caught this with a fake amp whose child slept 30s: a 150ms timeout took the
+// full 30 seconds, and only on Linux, because some /bin/sh exec-optimise the
+// last command away and accidentally make the kill sufficient.
+//
+// Setpgid puts amp in a group of its own and Cancel signals the group, so its
+// children die with it. WaitDelay is the backstop for a child that ignores the
+// signal or has already been reparented: it forces the pipes closed so Wait
+// returns regardless.
+func runAmp(ctx context.Context, bin string, args []string) (out, errOut string, err error) {
+	// #nosec G204 -- the binary is operator-configured (AMP_BIN) and the
+	// arguments are passed as an argv slice, never through a shell.
+	cmd := exec.CommandContext(ctx, bin, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	// Never inherit our stdin: that is the MCP transport.
+	cmd.Stdin = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = ampWaitDelay
+
+	err = cmd.Run()
+	return strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String()), err
 }
 
 // ampFailure explains a non-zero amp exit as precisely as the evidence allows,

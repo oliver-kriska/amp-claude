@@ -61,41 +61,42 @@ message queue.
 **Amp asks Claude:**
 
 ```text
-┌────────────────────────────── one machine, one user ──────────────────────────────┐
-│                                                                                   │
+┌────────────────────────────── one machine, one user ───────────────────────────────┐
+│                                                                                    │
 │  ┌────────────────────┐     ┌─────────────┐     ┌───────────────────────────────┐  │
-│  │ Amp thread or any  │────▶│ amp-bridge  │────▶│ Claude Code session           │  │
-│  │ local process      │     │ Unix socket │     │ started with the channel flag │  │
-│  │ caller waits       │◀────│             │◀────│ reply tool                    │  │
+│  │ Amp thread or any  │────▶│ question    │────▶│ Claude Code session           │  │
+│  │ local process      │     │ over a Unix │     │ started with the channel flag │  │
+│  │ caller waits       │◀────│ socket      │◀────│ reply tool                    │  │
 │  └────────────────────┘     └─────────────┘     └───────────────────────────────┘  │
-│              question ─────────────────────────────▶  ◀────────────── answer       │
-│                                                                                   │
-└───────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Claude asks Amp:**
 
 ```text
-┌────────────────────────────── one machine, one user ──────────────────────────────┐
-│                                                                                   │
-│  ┌──────────────────┐     ┌─────────────────────────┐                             │
-│  │ Claude ask_amp   │────▶│ Does this thread have  │                             │
-│  │ caller waits     │     │ a live plugin inbox?   │                             │
-│  └────────▲─────────┘     └────────────┬────────────┘                             │
-│           │                       yes  │  no                                      │
-│           │              ┌─────────────┘  └──────────────┐                        │
-│           │              ▼                               ▼                        │
-│           │   ┌──────────────────────┐      ┌──────────────────────────────┐       │
-│           │   │ plugin inside the   │      │ amp threads continue         │       │
-│           │   │ running Amp session │      │ --execute                    │       │
-│           │   └──────────┬───────────┘      └──────────┬───────────────────┘       │
-│           │              │                             ├─ thread idle ───────┐     │
-│           │              ▼                             │                    ▼     │
-│           └──────── Amp runs the turn ◀────────────────┘            error + fix   │
+┌────────────────────────────── one machine, one user ───────────────────────────────┐
+│                                                                                    │
+│  ┌──────────────────┐     ┌─────────────────────────┐                              │
+│  │ Claude ask_amp   │────▶│ Does this thread have  │                               │
+│  │ caller waits     │     │ a live plugin inbox?   │                               │
+│  └──────────────────┘     └────────────┬────────────┘                              │
+│                                  yes  │  no                                        │
+│                         ┌──────────────┘  └─────────────┐                          │
+│                         ▼                               ▼                          │
+│              ┌──────────────────────┐      ┌──────────────────────────────┐        │
+│              │ plugin inside the   │      │ amp threads continue         │         │
+│              │ running Amp session │      │ --execute                    │         │
+│              └──────────┬───────────┘      └──────────┬───────────────────┘        │
+│                         │                             ├─ thread idle ───────┐      │
+│                         ▼                             │                    ▼       │
+│                    Amp runs the turn ◀────────────────┘            error + fix     │
 │                         │                                      if already open     │
-│                         └──────────── final answer ───────────────────────▶         │
-│                                                                                   │
-└───────────────────────────────────────────────────────────────────────────────────┘
+│                         └──────────────┐                      ┌──────────────┘     │
+│                                        ▼                      ▼                    │
+│                         final answer or error returns to Claude                    │
+│                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 The inbox check happens before the CLI fallback. An open thread without an
