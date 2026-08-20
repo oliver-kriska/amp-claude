@@ -101,3 +101,26 @@ no releases yet**, so the rename costs nothing today and gets more expensive
 with every published artefact. GitHub keeps a redirect from the old name.
 
 Needs Oliver's approval; it is his repository and it is outward-facing.
+
+## Outcome, same day
+
+Repository renamed to `amp-claude`; `go install …@latest` verified working end
+to end. **v0.1.0 published**, and the release workflow succeeded on its first
+run — which was not the expectation recorded above, and is worth noting because
+the prediction was wrong in the optimistic direction for once.
+
+Everything the pipeline added was verified against the real artefacts rather
+than assumed:
+
+- all four tarballs pass `sha256sum -c checksums.txt`
+- `gh attestation verify` exits clean, and the certificate names
+  `oliver-kriska/amp-claude`, `.github/workflows/release.yml`, and
+  `refs/tags/v0.1.0` at commit `37dd4686` — so provenance is real, not just
+  configured
+
+The last blocker, that the inbox path had never run end to end, was retired by
+a purpose-built MCP client driving the production routing against a live Amp
+thread. Verified independently rather than taken on report: two separately
+written logs corroborate on request id `2c4e536ca363`, with `INBOX_ASK` →
+`INBOX_OK` on the Go side and `APPEND_TRY` → `APPEND_OK` on the plugin side,
+9.5 seconds apart — a real turn, not a stub.
