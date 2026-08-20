@@ -16,6 +16,7 @@ func TestParseArgs(t *testing.T) {
 		{"no arguments means serve", nil, options{mode: modeServe, dir: "."}},
 		{"list", []string{"--list"}, options{mode: modeList, dir: "."}},
 		{"help", []string{"--help"}, options{mode: modeHelp, dir: "."}},
+		{"version", []string{"--version"}, options{mode: modeVersion, dir: "."}},
 		{"ask", []string{"--ask", "hello"}, options{mode: modeAsk, text: "hello", dir: "."}},
 		{
 			"everything after --ask is the message",

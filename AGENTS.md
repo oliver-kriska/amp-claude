@@ -98,12 +98,19 @@ routing around a denial defeats the point of it.
 Keep messages self-contained. Claude sees the text and nothing else — not your
 thread history, not your files, not your tool output.
 
-`ask_amp` is also refused outright when you have the thread open interactively:
-Amp permits one executor per thread, and `threads continue --execute` cannot
-attach a second. So for a thread you are sitting in, the inbound direction is the
-only one that works — you call `amp-bridge --ask`, Claude answers with `reply`.
-Claude gets a diagnostic naming the pid holding the thread rather than Amp's
-`Unexpected error inside Amp CLI`.
+`ask_amp` can reach a thread you have open **only if that thread's inbox is
+enabled**. Amp permits one executor per thread and your interactive session holds
+it, so `threads continue --execute` cannot attach a second; the inbox plugin gets
+around that by appending through the executor your own session already holds.
+Install it with `amp-bridge init --amp-plugin --global`, reload plugins, then
+`Ctrl+O` → `amp-bridge: Enable Claude inbox for this thread`. It is off by default
+on every thread, and only you can turn it on — there is no way to enable it from
+outside the session.
+
+Without an inbox, the inbound direction is the only one that works for a thread
+you are sitting in — you call `amp-bridge --ask`, Claude answers with `reply`.
+Claude gets a diagnostic naming the pid holding the thread and pointing at the
+plugin, rather than Amp's `Unexpected error inside Amp CLI`.
 
 **If Claude started the exchange with `ask_amp`, do not call `amp-bridge --ask`
 in that same turn.** Claude's session is blocked inside the tool call until your
@@ -114,14 +121,16 @@ registry.
 
 ## Building and testing
 
-Toolchain is pinned in `.tool-versions` (mise): Go 1.26.6 and
-golangci-lint 2.12.2. Run `mise install` once; `make tools`
-reports the active versions and warns if they have drifted from the pins.
+Toolchain is pinned in `.tool-versions` (mise): Go 1.26.6,
+golangci-lint 2.12.2 and Bun 1.3.5 — Bun only to typecheck the Amp plugin. Run
+`mise install` once; `make tools` reports the active versions and warns if they
+have drifted from the pins.
 
 ```bash
 mise install           # once — pins Go and golangci-lint from .tool-versions
 make setup             # build + install to ~/.local/bin + register in ./.mcp.json
-make check             # tidy, skill drift, format, vet, lint, both test tiers — the gate
+make check             # tidy, both drift gates, plugin typecheck, format, vet,
+                       #   lint, govulncheck, both test tiers — the gate
 ```
 
 The Makefile and `go.mod` live at the repo root; the Go sources are in

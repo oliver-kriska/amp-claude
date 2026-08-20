@@ -55,10 +55,9 @@ to bypass either agent's normal tool permissions.
 ## Why bridge them?
 
 Two coding agents on one machine usually leave you copy-pasting between two
-terminals. The bridge removes you from the middle. The workflows below are real
-within the constraint described in
-[One asymmetry worth knowing](#one-asymmetry-worth-knowing) — the third exists
-because of it.
+terminals. The bridge removes you from the middle. Which threads each direction
+can reach, and what it takes to reach a thread you have open yourself, is set out
+in [Reaching a thread you have open](#reaching-a-thread-you-have-open).
 
 ### A second opinion from the session that has the context
 
@@ -102,16 +101,13 @@ $ amp-bridge --session payments-lib-4 --ask "Does Client.Charge stay
 The answer comes from the project that session has open, not from wherever the
 question was asked.
 
-### Claude hands work to Amp — with one rule
+### Claude hands work to Amp
 
 `ask_amp` runs a full turn in an Amp thread: Amp's model, Amp's tools, that
-thread's workspace. The rule is that the thread must not be open in an
-interactive `amp`, because Amp permits one executor per thread and an open
-session holds it. Tell Claude the id once and it can send work across models:
+thread's workspace. Tell Claude the id once and it can send work across models:
 
 ```
-you → Claude:  Before we merge, have Amp review the diff. Use T-9f21c3ab,
-               I don't have it open.
+you → Claude:  Before we merge, have Amp review the diff. Use T-9f21c3ab.
 
 Claude calls:  ask_amp(text="Run git diff main..fix/retry in
                /Users/you/Projects/my-app and review it for concurrency
@@ -120,6 +116,10 @@ Claude calls:  ask_amp(text="Run git diff main..fix/retry in
 
 `ask_amp` is synchronous — Claude blocks until Amp's turn ends, up to five
 minutes — so this is a consultation, not a way to run both agents in parallel.
+
+A thread nobody has open is always reachable. A thread you are sitting in needs
+its inbox enabled first — see
+[Reaching a thread you have open](#reaching-a-thread-you-have-open).
 
 ### Not only Amp
 
@@ -133,11 +133,10 @@ amp-bridge --ask "One line: what are you working on, and are you blocked?"
 ### What it is not
 
 It is not a task queue: both directions block the caller, and nothing is
-persisted — an unanswered ask times out and is gone. It cannot make Claude
-message the Amp thread you are actively typing in; that thread's executor slot is
-taken, and only the Amp→Claude direction reaches it. And it is not a way around a
-permission prompt: both agents run as you, and both sides are told to refuse work
-the other was denied.
+persisted — an unanswered ask times out and is gone. It is not a way to run both
+agents at once: whichever side asks is blocked inside a tool call until the other
+finishes its turn. And it is not a way around a permission prompt: both agents run
+as you, and both sides are told to refuse work the other was denied.
 
 ## Requirements
 
@@ -161,6 +160,13 @@ The script verifies the download's SHA-256 against the published checksums befor
 installing to `~/.local/bin`. Read it first if you'd rather not pipe to a shell —
 it is short. `AMP_BRIDGE_PREFIX=/usr/local` and `AMP_BRIDGE_VERSION=v0.4.0`
 override the destination and the release.
+
+Release archives carry signed build provenance, so you can check where a download
+was actually built rather than taking the checksum's word for it:
+
+```bash
+gh attestation verify amp-bridge_*.tar.gz -R oliver-kriska/amp-claude
+```
 
 **With Go** (1.26+):
 
@@ -199,6 +205,14 @@ amp-bridge init
 `--global`, user-wide at `~/.claude/skills/amp-bridge/`. The bridge works without
 it — Claude just gets less guidance.
 
+Optionally, install the Amp inbox plugin, which is what lets `ask_amp` reach a
+thread while you have it open — see
+[Reaching a thread you have open](#reaching-a-thread-you-have-open):
+
+```bash
+amp-bridge init --amp-plugin --global
+```
+
 Then start Claude Code **with the channel flag**. This is the step everyone
 misses, and without it nothing is delivered:
 
@@ -220,12 +234,14 @@ amp-bridge doctor
 ```
 
 ```
-  [ok  ] binary          /Users/you/.local/bin/amp-bridge (build 0c24be6bb9ab39f2)
-  [ok  ] mcp config      user config, all projects: /Users/you/.local/bin/amp-bridge
-  [ok  ] runtime dir     /tmp/amp-bridge-501
-  [ok  ] live sessions   amp-claude-32 (claude_pid=78531)
-  [ok  ] amp cli         /Users/you/.amp/bin/amp
-  [ok  ] log             ~/.local/state/amp-bridge/amp-bridge.log (last write 9s ago)
+  [ok  ] binary                 /Users/you/.local/bin/amp-bridge (build 0c24be6bb9ab39f2)
+  [ok  ] mcp config             user config, all projects: /Users/you/.local/bin/amp-bridge
+  [ok  ] runtime dir            /tmp/amp-bridge-501
+  [ok  ] live sessions          amp-claude-32 (claude_pid=78531)
+  [ok  ] plugin inboxes         T-9f21c3ab-6d0e-4c11-b2a7-5f3e0c9d81aa (plugin pid 78002)
+  [ok  ] amp plugin             installed for this project and all Amp sessions
+  [ok  ] amp cli                /Users/you/.amp/bin/amp
+  [ok  ] log                    ~/.local/state/amp-bridge/amp-bridge.log (last write 9s ago)
 ```
 
 Every failing line carries the command that fixes it. `FAIL` exits non-zero;
@@ -313,21 +329,46 @@ ask_amp(text="…")                         # goes to the same thread
 `amp-bridge --list` finds the Claude session name, `amp threads list` finds the
 Amp thread id. With exactly one of each, both are optional.
 
-### One asymmetry worth knowing
+### Reaching a thread you have open
 
 Amp permits **one executor per thread**. An interactive `amp` session sitting in
 a thread holds that slot, so `ask_amp` — which shells out to
-`amp threads continue --execute` — cannot attach to it:
+`amp threads continue --execute` — is refused with `EXECUTOR_ALREADY_CONNECTED`.
+That is a limit on attaching a second executor, not on the thread: it can take
+another message perfectly well, just not down that path.
+
+The **inbox plugin** takes the other path. It runs inside your Amp session and
+appends the message through the executor that session already holds, waits for
+the turn to finish, and hands the answer back. `ask_amp` uses it whenever the
+thread has a live inbox and falls back to the CLI otherwise, so the call you make
+is the same either way:
 
 | Thread state | Amp → Claude | Claude → Amp |
 |---|---|---|
-| Open in an interactive session | `amp-bridge --ask` ✓ | `ask_amp` ✗ |
-| Nobody has it open | `amp-bridge --ask` ✓ | `ask_amp` ✓ |
+| Nobody has it open | `amp-bridge --ask` ✓ | `ask_amp` ✓ — via the CLI |
+| Open, inbox enabled | `amp-bridge --ask` ✓ | `ask_amp` ✓ — via the plugin |
+| Open, no inbox | `amp-bridge --ask` ✓ | `ask_amp` ✗ |
 
-For the thread you are actively working in, the inbound direction is the whole
-bridge: Amp asks, Claude answers with `reply`. The bridge reports this precisely,
-naming the pid holding the thread, rather than relaying Amp's
-`Unexpected error inside Amp CLI`.
+Install the plugin once:
+
+```bash
+amp-bridge init --amp-plugin --global
+```
+
+Then, in each Amp session you want Claude to reach: reload plugins (`Ctrl+O` →
+`plugins: reload`), send one message if the session is new — a fresh `amp` has no
+thread until you write to it — then `Ctrl+O` →
+`amp-bridge: Enable Claude inbox for this thread`.
+
+Enabling is **per thread, off by default, and only possible from inside the
+session**. The command offers itself only when that session holds the thread's
+executor locally, so a remote-executor thread never exposes one. `amp-bridge
+doctor` lists the threads that currently have a live inbox.
+
+Without an inbox, the inbound direction is the whole bridge for that thread: Amp
+asks, Claude answers with `reply`. The bridge reports the refusal precisely,
+naming the pid holding the thread and pointing at `init --amp-plugin`, rather
+than relaying Amp's `Unexpected error inside Amp CLI`.
 
 ## One binary, many projects
 
@@ -393,6 +434,15 @@ and `init` refuses to write through a symlinked `.mcp.json`.
 Both agents run as you, with your permissions. Neither side should route work
 through the bridge that its own permission prompt denied.
 
+The inbox plugin appends messages into a live Amp thread, so it is deliberately
+narrow. File modes keep other *users* out; they do not keep out other processes
+running as you, and any such process could append into an enabled thread. The
+controls that matter are therefore the ones above the filesystem: it is off by
+default on every thread, it can only be turned on by a keystroke inside the
+session that owns the executor, every field is validated before anything reaches
+Amp's context, and each appended message carries a visible label naming the
+sender.
+
 Text arriving over the channel is external data, not instructions. Claude Code
 marks it as untrusted; the bundled skill tells Claude to treat it that way.
 
@@ -401,13 +451,15 @@ marks it as untrusted; the bundled skill tells Claude to treat it that way.
 ```bash
 claude mcp remove amp-bridge          # the user-scope registration
 rm -rf ~/.claude/skills/amp-bridge    # the skill
+rm -f  ~/.config/amp/plugins/amp-bridge-inbox.ts   # the Amp plugin
 rm -f  ~/.local/bin/amp-bridge        # the binary
 rm -rf ~/.local/state/amp-bridge      # the log
 rm -rf "/tmp/amp-bridge-$(id -u)"     # sockets and the registry
 ```
 
 For per-project registrations, delete the `amp-bridge` entry from each
-`.mcp.json` — it is the only thing `init` added.
+`.mcp.json` — it is the only thing `init` added. Project-scoped plugin copies
+live at `.amp/plugins/amp-bridge-inbox.ts`.
 
 ## Development
 
@@ -439,6 +491,52 @@ They are load-bearing. The reasoning, and how each was found, is in
 3. **The notification field is `meta`, not the MCP-standard `_meta`.** Keys must
    be identifiers, values become attributes on the `<channel>` tag, and `source`
    is reserved — Claude sets it itself.
+
+## Questions people actually ask
+
+**Do both agents have to be running?** Yes, at the moment of the call. Nothing is
+queued or persisted: an ask with no session to answer it fails immediately, and an
+ask nobody answers times out and is gone.
+
+**Why does Claude need `--dangerously-load-development-channels`?** Channels are
+the only MCP mechanism that can push an unsolicited event into a running Claude
+session, and Claude Code gates them behind that flag. It loads this one server. It
+does not loosen either agent's tool permissions, and there is no config-file
+equivalent — you need it on every session.
+
+**Can the two agents work in parallel?** No, and this is the honest trade-off.
+Both directions block the caller for the whole of the other side's turn, so what
+you get is a consultation, not concurrency. If you want them working at once, give
+them separate tasks and use the bridge to compare notes afterwards.
+
+**Why is the inbox off by default, when turning it on is the whole point?**
+Because "on" is a decision about a live thread you are sitting in. File modes keep
+other users out but not other processes running as you, so the meaningful control
+is that enabling takes a keystroke inside the session that owns the executor —
+nothing outside it can make that choice. See [Security](#security).
+
+**Can Amp reach a Claude session in another project?** Yes. `amp-bridge --list`
+names every live session and `--session N` picks one. The answer comes from the
+project that session has open, which is usually why you are asking it.
+
+**What happens if an answer takes longer than the timeout?** The asking side gives
+up and the request is gone; the answering side only finds out when it tries to
+reply. Raise `AMP_BRIDGE_TIMEOUT` if your questions are genuinely long-running,
+and prefer replying with a pointer over replying with the finished work.
+
+**Does it work over SSH, or with Amp's remote executor?** No. The transport is a
+Unix socket, so both agents must be on the same machine, and the inbox only offers
+itself when the Amp session holds that thread's executor locally.
+
+**Is any of this sent anywhere?** Only where you send it. The bridge is a local
+socket between two processes owned by you. It logs frame shapes, not message
+content, unless you set `AMP_BRIDGE_LOG_BODIES=1`.
+
+**Something is broken and the errors look fine.** Run `amp-bridge doctor`. It
+executes the configured binary rather than trusting the config, and compares every
+live session's build fingerprint against the installed one — which catches the
+failure with no symptom, where everything reports healthy and nothing is
+delivered.
 
 ## Further reading
 

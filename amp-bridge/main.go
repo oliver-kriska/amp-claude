@@ -42,6 +42,7 @@ const (
 	modeList
 	modeAsk
 	modeHelp
+	modeVersion
 	modeDoctor
 	modeInit
 )
@@ -71,6 +72,7 @@ const usage = `amp-bridge — bridge an Amp thread to a Claude Code session
                                         enabled per thread
   amp-bridge doctor [dir] [--strict]    diagnose why the channel is not working
   amp-bridge --list                     list live bridges
+  amp-bridge --version                  print the version and build fingerprint
   amp-bridge [--session N] [--thread T] --ask "text"
 
 Environment:
@@ -101,6 +103,9 @@ func parseArgs(args []string) (options, error) {
 			o.mode = modeList
 		case "--help", "-h":
 			o.mode = modeHelp
+			return o, nil
+		case "--version":
+			o.mode = modeVersion
 			return o, nil
 		case "--session", "--thread":
 			if i+1 >= len(args) {
@@ -206,6 +211,13 @@ func run(args []string) int {
 	switch opts.mode {
 	case modeHelp:
 		fmt.Println(usage)
+		return 0
+	case modeVersion:
+		// Releases stamp this via -ldflags; a source build reports "dev". The
+		// build fingerprint is what `doctor` compares sessions against, so
+		// printing both means one command answers "which release" and "which
+		// binary" together.
+		fmt.Printf("amp-bridge %s (build %s)\n", serverVersion, buildFingerprint())
 		return 0
 	case modeList:
 		return cmdList()
