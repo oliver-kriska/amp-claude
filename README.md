@@ -31,10 +31,11 @@ Install the latest release:
 curl -fsSL https://raw.githubusercontent.com/oliver-kriska/amp-claude/main/install.sh | sh
 ```
 
-Register the channel for all Claude Code projects, then start a session with it:
+Set up both directions once, then start a Claude session with the channel:
 
 ```bash
-amp-bridge init --global
+amp-bridge init --global               # Claude channel + skill
+amp-bridge init --amp-plugin --global  # Amp inbox plugin
 claude --dangerously-load-development-channels server:amp-bridge
 ```
 
@@ -47,10 +48,153 @@ amp-bridge --ask "Reply with exactly PONG"
 
 If the second command prints `PONG`, the complete request/reply path works. If
 it does not, run `amp-bridge doctor`; every failing check includes its fix.
+To let Claude initiate into an open Amp thread, send that thread's first message
+and run `Ctrl+O` → `amp-bridge: Enable Claude inbox for this thread` once.
 
 The long flag is required because Claude Code only loads a custom local channel
 server when you explicitly opt into development channels. It is not a request
 to bypass either agent's normal tool permissions.
+
+## Your first two-way conversation
+
+The channel, the skill and the inbox plugin are separate on purpose. Install
+both sides once:
+
+```bash
+amp-bridge init --global               # Claude channel registration + Claude skill
+amp-bridge init --amp-plugin --global  # Amp inbox plugin
+```
+
+That is the setup cost. Once the pair is established, normal use is two
+plain-language prompts:
+
+```text
+you → Amp:     Use amp-bridge to ask Claude session my-app-review to review auth.go.
+you → Claude:  Ask Amp whether the running app reproduced the race.
+```
+
+You do not handle sockets, request ids or bridge protocol in daily use. Omit the
+session name when only one Claude session is live. Pass the Amp thread id once
+to establish the pair; the bridge remembers it for later questions.
+
+| Frequency | Action |
+|---|---|
+| Once per machine | Install the binary and run the two `init` commands above |
+| Each Claude session | Start it with the channel flag—or use the `claude-amp` alias below |
+| Each Amp process/thread | Enable the inbox only if Claude must initiate into that open thread |
+| Each question | Ask in ordinary language and wait for the answer in the same turn |
+
+| Part | What it does | What it does not do |
+|---|---|---|
+| Claude channel | Carries Amp's request into a running Claude session and correlates its reply | Does not teach Claude when to use the bridge |
+| Claude skill | Teaches Claude to answer with `reply` and start a turn with `ask_amp` | Is not a transport and does not enable an Amp inbox |
+| Amp inbox plugin | Lets Claude start a turn in an Amp thread that is already open | Does not register or start the Claude channel |
+
+You do not invoke the skill yourself. Claude loads it when an amp-bridge event
+arrives or when you ask Claude to "ask Amp".
+
+### 1. Start the Claude session
+
+Run this from the project whose context you want Claude to use:
+
+```bash
+cd ~/Projects/my-app
+claude --name my-app-review \
+  --dangerously-load-development-channels server:amp-bridge
+```
+
+`--name` is optional, but useful when several Claude sessions are live. If
+Claude was already running when you installed or rebuilt the bridge, restart or
+resume it with the channel flag; a running session cannot acquire the channel
+later.
+
+### 2. Prepare the Amp thread
+
+Open the target thread in a local Amp session and send its first message. A
+fresh `amp` process has no thread until then.
+
+Then enable the inbox for that thread:
+
+```text
+Ctrl+O → amp-bridge: Enable Claude inbox for this thread
+```
+
+If that command is not in the palette, Amp was already running when you
+installed the plugin: run `Ctrl+O` → `plugins: reload` first, then enable.
+
+The inbox is off by default and enabled per thread. It is needed only for
+**Claude → an Amp thread that is currently open**; Amp → Claude and Claude → a
+thread nobody has open work without it.
+
+Copy the Amp thread id from the thread URL — its final `T-…` segment — or find
+it with `amp threads list`.
+
+### 3. Amp asks Claude
+
+In the Amp thread, ask Amp to run the following (or run it from another local
+shell):
+
+```bash
+amp-bridge --list
+amp-bridge --session my-app-review \
+  --thread T-abc123 \
+  --ask "Inspect auth.go and tell me whether the refresh path can race logout."
+```
+
+`--session` chooses the Claude project that should answer. `--thread` tells
+Claude which Amp thread originated the request, so it can follow up later.
+Claude receives the question as a channel event; the installed skill tells it
+to call `reply`, and the answer is printed back into Amp's turn.
+
+With exactly one live Claude session, omit `--session`. To make Amp discover the
+bridge without being told each time, add the short `AGENTS.md` snippet under
+[Tell Amp it exists](#tell-amp-it-exists).
+
+### 4. Claude asks the same Amp thread
+
+Now tell Claude:
+
+```text
+Ask Amp thread T-abc123 whether the running app has reproduced that logout race.
+```
+
+The skill makes Claude call:
+
+```text
+ask_amp(
+  text="Has the running app reproduced the logout race? Check runtime evidence.",
+  thread_id="T-abc123"
+)
+```
+
+Because the inbox is enabled, this appends the question through the executor
+already owned by the open Amp session, waits for Amp's turn, and returns Amp's
+final answer to Claude. If Amp previously used `--thread T-abc123`, the pairing
+is remembered and Claude may omit `thread_id`; explicit is safer when several
+threads share one Claude session.
+
+When Claude starts the exchange with `ask_amp`, Amp should answer normally. It
+must not call `amp-bridge --ask` back during that turn: Claude is blocked inside
+the tool call and cannot answer a second inbound event until Amp finishes.
+
+### Plugin scope and reloads
+
+| Choice | Best for | Trade-off |
+|---|---|---|
+| `amp-bridge init --amp-plugin /path/to/project` | One repository | Writes `.amp/plugins/amp-bridge-inbox.ts`; install it separately elsewhere |
+| `amp-bridge init --amp-plugin --global` | Using the bridge across projects | Loads in every Amp process, but remains inert until you enable a thread |
+| Amp's `load_plugin` tool on `~/.config/amp/plugins/amp-bridge-inbox.ts` | Loading or updating only this plugin | Does not restart unrelated plugins |
+| `Ctrl+O` → `plugins: reload` | Discovering all newly installed global plugins | Restarts every plugin, not just amp-bridge |
+
+An enabled thread answers one question at a time and holds at most four more
+waiting; past that, `ask_amp` is told the inbox is busy rather than queued
+indefinitely. Enabled inboxes survive a plugin reload in the same Amp process,
+but not an Amp restart. Do not reload while `ask_amp` is in flight: the old plugin aborts that
+request before the new copy re-arms the inbox, and delivery may already have
+reached Amp. Check the thread before retrying so you do not append it twice.
+
+Choose project or global scope rather than both. If both copies are present,
+the load guard keeps one inert, but Amp will still show two installed files.
 
 ## How it works
 
@@ -58,46 +202,9 @@ Both directions are synchronous: the asking side waits while the other agent
 runs a turn, then receives its final answer. This is a local round trip, not a
 message queue.
 
-**Amp asks Claude:**
-
-```text
-┌────────────────────────────── one machine, one user ───────────────────────────────┐
-│                                                                                    │
-│  ┌────────────────────┐     ┌─────────────┐     ┌───────────────────────────────┐  │
-│  │ Amp thread or any  │────▶│ question    │────▶│ Claude Code session           │  │
-│  │ local process      │     │ over a Unix │     │ started with the channel flag │  │
-│  │ caller waits       │◀────│ socket      │◀────│ reply tool                    │  │
-│  └────────────────────┘     └─────────────┘     └───────────────────────────────┘  │
-│                                                                                    │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Claude asks Amp:**
-
-```text
-┌────────────────────────────── one machine, one user ───────────────────────────────┐
-│                                                                                    │
-│  ┌──────────────────┐     ┌─────────────────────────┐                              │
-│  │ Claude ask_amp   │────▶│ Does this thread have  │                               │
-│  │ caller waits     │     │ a live plugin inbox?   │                               │
-│  └──────────────────┘     └────────────┬────────────┘                              │
-│                                  yes  │  no                                        │
-│                         ┌──────────────┘  └─────────────┐                          │
-│                         ▼                               ▼                          │
-│              ┌──────────────────────┐      ┌──────────────────────────────┐        │
-│              │ plugin inside the   │      │ amp threads continue         │         │
-│              │ running Amp session │      │ --execute                    │         │
-│              └──────────┬───────────┘      └──────────┬───────────────────┘        │
-│                         │                             ├─ thread idle ───────┐      │
-│                         ▼                             │                    ▼       │
-│                    Amp runs the turn ◀────────────────┘            error + fix     │
-│                         │                                      if already open     │
-│                         └──────────────┐                      ┌──────────────┘     │
-│                                        ▼                      ▼                    │
-│                         final answer or error returns to Claude                    │
-│                                                                                    │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="docs/assets/amp-bridge-flow.png" width="900" alt="Two synchronous local amp-bridge flows. Amp asks Claude through a Unix socket and Claude returns an answer with the reply tool. Claude asks Amp through ask_amp: a live inbox routes through the Amp plugin, while no inbox falls back to the CLI, which runs an idle thread or returns an executor-conflict diagnostic for an open thread.">
+</p>
 
 The inbox check happens before the CLI fallback. An open thread without an
 enabled inbox therefore reaches the fallback and is refused because Amp will
@@ -210,7 +317,7 @@ curl -fsSL https://raw.githubusercontent.com/oliver-kriska/amp-claude/main/insta
 
 The script verifies the download's SHA-256 against the published checksums before
 installing to `~/.local/bin`. Read it first if you'd rather not pipe to a shell —
-it is short. `AMP_BRIDGE_PREFIX=/usr/local` and `AMP_BRIDGE_VERSION=v0.4.0`
+it is short. `AMP_BRIDGE_PREFIX=/usr/local` and `AMP_BRIDGE_VERSION=v0.1.0`
 override the destination and the release.
 
 Release archives carry signed build provenance, so you can check where a download
@@ -231,12 +338,13 @@ go install github.com/oliver-kriska/amp-claude/amp-bridge@latest
 ```bash
 git clone https://github.com/oliver-kriska/amp-claude
 cd amp-claude
-mise install     # optional: pins Go + golangci-lint from .tool-versions
-make setup       # build, install, and register in this checkout
+mise install       # optional: pins Go + golangci-lint from .tool-versions
+make setup-global  # build, install, and set up both directions machine-wide
 ```
 
-`make setup` registers this checkout only. Follow it with `amp-bridge init
---global` to cover your own projects.
+For one project instead, `make setup PROJECT="$HOME/Projects/my-app"` registers
+only that project's Claude channel; install its Amp plugin separately with
+`amp-bridge init --amp-plugin "$HOME/Projects/my-app"`.
 
 ### Register it
 
