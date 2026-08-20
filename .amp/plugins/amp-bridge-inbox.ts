@@ -98,8 +98,25 @@ export default function (amp: PluginAPI) {
   const runtimeDir = process.env.AMP_BRIDGE_DIR || `/tmp/amp-bridge-${uid}`
   const inboxDir = path.join(runtimeDir, 'inbox')
   const threadsDir = path.join(inboxDir, 'threads')
+  // Intent is kept apart from registration on purpose. `threads/` is the live
+  // registration the Go side reads and is entitled to sweep when the socket
+  // behind it is gone; `intent/` is the user's decision, which nothing outside
+  // this plugin touches. Keeping them in one file meant a sweep during the
+  // reload window — exactly when the socket is legitimately absent — would
+  // destroy the choice we are trying to restore.
+  const intentDir = path.join(inboxDir, 'intent')
   const sockPath = path.join(inboxDir, `plugin-${process.pid}.sock`)
   const logPath = path.join(inboxDir, 'plugin.log')
+
+  // Identifies this *process* across a plugin reload. Module state does not
+  // survive a reload, and process.pid alone is not enough: a later process that
+  // reuses the pid would inherit intents it never consented to, and this design
+  // has been bitten by fixed names in shared namespaces three times already.
+  // Deriving the start instant from uptime gives a value stable across reloads
+  // and distinct per process. Clock drift only ever loses a re-arm, which is
+  // the safe direction — you re-enable by hand.
+  const PROCESS_STARTED_AT = Math.round(Date.now() - process.uptime() * 1000)
+  const START_TOLERANCE_MS = 2_000
 
   const enabled = new Map<string, true>()
   const lanes = new Map<string, Lane>()
@@ -161,6 +178,7 @@ export default function (amp: PluginAPI) {
           thread_id: threadID,
           socket: sockPath,
           plugin_pid: process.pid,
+          plugin_started_at: PROCESS_STARTED_AT,
           proto: PROTO,
           enabled_at: new Date().toISOString(),
           note: 'amp-bridge plugin inbox; consumed by ask_amp',
@@ -176,6 +194,51 @@ export default function (amp: PluginAPI) {
       fs.unlinkSync(entryPath(threadID))
     } catch {
       /* already gone */
+    }
+  }
+
+  function intentPath(threadID: string): string {
+    if (!THREAD_ID_RE.test(threadID)) throw new Error(`implausible thread id ${threadID}`)
+    return path.join(intentDir, `${threadID}.json`)
+  }
+
+  // Survives dispose. Removed only when the user explicitly disables the thread,
+  // or when its owning process is provably gone.
+  function writeIntent(threadID: string): void {
+    ensureDir(intentDir)
+    writeFileAtomic(
+      intentPath(threadID),
+      JSON.stringify(
+        {
+          thread_id: threadID,
+          plugin_pid: process.pid,
+          plugin_started_at: PROCESS_STARTED_AT,
+          enabled_at: new Date().toISOString(),
+          note: 'amp-bridge plugin inbox; the user enabled this thread. Not read by ask_amp.',
+        },
+        null,
+        2,
+      ),
+    )
+  }
+
+  function removeIntent(threadID: string): void {
+    try {
+      fs.unlinkSync(intentPath(threadID))
+    } catch {
+      /* already gone */
+    }
+  }
+
+  // Alive means "exists and is not ours to reap". EPERM is a live process owned
+  // by somebody else, which must not be treated as absent.
+  function pidAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'EPERM'
     }
   }
 
@@ -664,6 +727,14 @@ export default function (amp: PluginAPI) {
         if (enabled.size === 0) await stopServer()
         return
       }
+      try {
+        writeIntent(threadID)
+      } catch (err) {
+        // Not fatal: the thread is enabled for this load, it just will not come
+        // back by itself after a reload. Losing the convenience must not cost
+        // the enable the user actually asked for.
+        log(`INTENT_WRITE_FAIL thread=${threadID} ${String(err)}`)
+      }
       enabled.set(threadID, true)
       log(`ENABLED thread=${threadID}`)
       refreshAvailability()
@@ -707,6 +778,7 @@ export default function (amp: PluginAPI) {
       lanes.delete(threadID)
     }
     removeEntry(threadID)
+    removeIntent(threadID)
     log(`DISABLED thread=${threadID} (${why})`)
     // Fully quiescent again when the last thread goes.
     if (enabled.size === 0) await stopServer()
@@ -729,14 +801,18 @@ export default function (amp: PluginAPI) {
     disposed = true
     log('DISPOSE_START')
 
-    for (const [threadID, l] of lanes) {
+    for (const l of lanes.values()) {
       for (const r of [l.inflight, ...l.queue].filter(Boolean) as ReqState[]) {
         if (r.timer) clearTimeout(r.timer)
         if (r.orphan) clearTimeout(r.orphan)
         respond(r, { error: 'the plugin is reloading or unloading', code: 'disabled' })
       }
-      removeEntry(threadID)
     }
+    // Registrations are keyed on enablement, not on traffic. Lanes are created
+    // lazily by the first request, so iterating them here left a registration
+    // behind for every thread that was enabled and never asked anything.
+    // Intents are deliberately kept: they are what a reload re-arms from.
+    for (const threadID of enabled.keys()) removeEntry(threadID)
     lanes.clear()
     enabled.clear()
 
@@ -757,8 +833,109 @@ export default function (amp: PluginAPI) {
     // destroy loop above comes first: awaiting it with a peer still attached
     // would block past the dispose budget and leave the socket bound.
     await stopServer()
+
+    // Release the load guard LAST. It exists to stop a second copy initialising
+    // in the same process, but load_plugin disposes and re-evaluates in that
+    // same process — so leaving it set meant the reloaded copy took the early
+    // return and came back completely inert: no commands, no socket, no way to
+    // notice short of ask_amp failing. Clearing it here keeps the duplicate-copy
+    // protection (the second copy of a given load still sees it set) while
+    // letting a reload actually reload.
+    delete g[LOAD_GUARD]
     log('DISPOSE_DONE')
   })
 
+  // ---- re-arm across a reload -------------------------------------------
+  // load_plugin disposes and re-evaluates this module in the same process, so
+  // without this every reload silently drops every inbox and the user finds out
+  // when ask_amp fails. Intents record the decision; this restores it.
+  //
+  // The gate is deliberately narrow. Only intents written by THIS process, as
+  // identified by pid and start instant together, are re-armed. A different pid
+  // belongs to another live Amp; the same pid with a different start instant is
+  // a previous process whose pid we inherited, and arming from that would enable
+  // a thread this session never consented to. Everything else is left alone, or
+  // swept once its owner is provably gone.
+  async function rearmFromIntents(): Promise<void> {
+    let names: string[]
+    try {
+      names = fs.readdirSync(intentDir)
+    } catch {
+      return // nothing has ever been enabled; stay inert
+    }
+
+    // A session that has moved to a remote executor cannot serve an inbox, and
+    // 'unknown' is not evidence of that — refusing on it would lose re-arms to a
+    // race with Amp's own startup, which is the opposite of the point.
+    const kind = (amp as { system?: { executor?: { kind?: string } } }).system?.executor?.kind
+    if (kind === 'remote') {
+      log('REARM_SKIP executor=remote')
+      return
+    }
+
+    let armed = 0
+    for (const name of names) {
+      if (disposed) return
+      if (!name.endsWith('.json')) continue
+      const threadID = name.slice(0, -'.json'.length)
+      if (!THREAD_ID_RE.test(threadID)) continue
+
+      let intent: { plugin_pid?: unknown; plugin_started_at?: unknown }
+      try {
+        intent = JSON.parse(fs.readFileSync(path.join(intentDir, name), 'utf8'))
+      } catch {
+        continue // unreadable or half-written; leave it for its owner
+      }
+      const pid = Number(intent.plugin_pid)
+      const startedAt = Number(intent.plugin_started_at)
+
+      if (pid !== process.pid) {
+        // Another Amp's decision. Sweep only if that process is gone; a live one
+        // is entitled to its intent even though its socket is not ours to see.
+        if (!pidAlive(pid)) removeIntent(threadID)
+        continue
+      }
+      if (!Number.isFinite(startedAt) || Math.abs(startedAt - PROCESS_STARTED_AT) > START_TOLERANCE_MS) {
+        // Our pid, someone else's process. That process cannot still be running,
+        // because we are holding its pid.
+        log(`REARM_SKIP thread=${threadID} pid-reuse (intent start ${startedAt})`)
+        removeIntent(threadID)
+        continue
+      }
+
+      if (!server) {
+        try {
+          await startServer()
+        } catch (err) {
+          // Same rule as enable: never half-arm. No socket means no entry, so
+          // the Go side sees a clean absence rather than a dead registration.
+          log(`REARM_FAIL could not listen — ${String(err)}`)
+          return
+        }
+      }
+      try {
+        writeEntry(threadID)
+      } catch (err) {
+        log(`REARM_FAIL thread=${threadID} ${String(err)}`)
+        continue
+      }
+      enabled.set(threadID, true)
+      armed++
+      log(`REARMED thread=${threadID}`)
+    }
+
+    if (armed > 0) {
+      refreshAvailability()
+    } else if (enabled.size === 0) {
+      // Started a listener for an intent that then failed to register. Inert is
+      // the resting state; do not leave a socket bound serving nothing.
+      await stopServer()
+    }
+  }
+
   refreshAvailability()
+
+  // Fire and forget: a failure here costs convenience, never correctness, and
+  // must not stop the plugin loading.
+  void rearmFromIntents().catch((err) => log(`REARM_ERROR ${String(err)}`))
 }

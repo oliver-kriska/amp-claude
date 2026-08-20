@@ -97,6 +97,15 @@ plugin-typecheck: ## Type-check the Amp plugin against Amp's published types
 		echo "bun missing: run 'mise install' (pinned in .tool-versions)"; exit 1; }
 	@cd amp-bridge/plugin && bun install --silent && bunx tsc --noEmit
 
+.PHONY: plugin-test
+# The plugin's reload path has no symptom short of ask_amp failing — a load that
+# returns early registers nothing and logs nothing. Driving the real module
+# against a fake PluginAPI is the only tier that can see it.
+plugin-test: ## Run the Amp plugin's own tests
+	@command -v bun >/dev/null || { \
+		echo "bun missing: run 'mise install' (pinned in .tool-versions)"; exit 1; }
+	@cd amp-bridge/plugin && bun install --silent && bun test
+
 .PHONY: setup-global
 setup-global: install ## Register the bridge, skill and Amp plugin for all projects
 	@"$(BINDIR)/$(BIN)" init --global
@@ -156,7 +165,7 @@ tidy: ## Verify go.mod is tidy
 	$(GO) mod tidy -diff
 
 .PHONY: check
-check: tidy skill-check plugin-check plugin-typecheck fmt-check vet lint vuln test test-integration ## Everything above
+check: tidy skill-check plugin-check plugin-typecheck plugin-test fmt-check vet lint vuln test test-integration ## Everything above
 	@echo "all checks passed"
 
 .PHONY: tools
