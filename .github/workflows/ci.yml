@@ -27,13 +27,28 @@ jobs:
       # Not pinned in .tool-versions because it is a checker rather than part of
       # the build: nothing it reports changes the artefact, and pinning it would
       # mean freezing the vulnerability database along with the tool.
+      # GOBIN is set explicitly rather than trusting `go env GOPATH`: under mise
+      # the Go toolchain is mise-managed, and the first cut of this step wrote a
+      # GOPATH/bin to GITHUB_PATH that did not contain the binary — every run
+      # since has failed at `make check` with "govulncheck missing". Naming the
+      # directory ourselves means the same string is used to install and to find.
       - name: Install govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gotools"
+          GOBIN="$RUNNER_TEMP/gotools" go install golang.org/x/vuln/cmd/govulncheck@latest
+          test -x "$RUNNER_TEMP/gotools/govulncheck"
+          echo "$RUNNER_TEMP/gotools" >> "$GITHUB_PATH"
 
       # tidy, skill and plugin drift, TypeScript type-check against Amp's
       # published types, formatting, go vet on both build tags, 29 linters,
       # stdlib vulnerabilities, and both test tiers under -race. Same command a
       # contributor runs.
+      - name: Confirm the toolchain the gate needs
+        run: |
+          set -euo pipefail
+          command -v govulncheck
+          command -v golangci-lint
+          command -v bun
+
       - run: make check

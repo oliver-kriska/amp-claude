@@ -52,6 +52,57 @@ The long flag is required because Claude Code only loads a custom local channel
 server when you explicitly opt into development channels. It is not a request
 to bypass either agent's normal tool permissions.
 
+## How it works
+
+Both directions are synchronous: the asking side waits while the other agent
+runs a turn, then receives its final answer. This is a local round trip, not a
+message queue.
+
+**Amp asks Claude:**
+
+```text
+┌────────────────────────────── one machine, one user ──────────────────────────────┐
+│                                                                                   │
+│  ┌────────────────────┐     ┌─────────────┐     ┌───────────────────────────────┐  │
+│  │ Amp thread or any  │────▶│ amp-bridge  │────▶│ Claude Code session           │  │
+│  │ local process      │     │ Unix socket │     │ started with the channel flag │  │
+│  │ caller waits       │◀────│             │◀────│ reply tool                    │  │
+│  └────────────────────┘     └─────────────┘     └───────────────────────────────┘  │
+│              question ─────────────────────────────▶  ◀────────────── answer       │
+│                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Claude asks Amp:**
+
+```text
+┌────────────────────────────── one machine, one user ──────────────────────────────┐
+│                                                                                   │
+│  ┌──────────────────┐     ┌─────────────────────────┐                             │
+│  │ Claude ask_amp   │────▶│ Does this thread have  │                             │
+│  │ caller waits     │     │ a live plugin inbox?   │                             │
+│  └────────▲─────────┘     └────────────┬────────────┘                             │
+│           │                       yes  │  no                                      │
+│           │              ┌─────────────┘  └──────────────┐                        │
+│           │              ▼                               ▼                        │
+│           │   ┌──────────────────────┐      ┌──────────────────────────────┐       │
+│           │   │ plugin inside the   │      │ amp threads continue         │       │
+│           │   │ running Amp session │      │ --execute                    │       │
+│           │   └──────────┬───────────┘      └──────────┬───────────────────┘       │
+│           │              │                             ├─ thread idle ───────┐     │
+│           │              ▼                             │                    ▼     │
+│           └──────── Amp runs the turn ◀────────────────┘            error + fix   │
+│                         │                                      if already open     │
+│                         └──────────── final answer ───────────────────────▶         │
+│                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The inbox check happens before the CLI fallback. An open thread without an
+enabled inbox therefore reaches the fallback and is refused because Amp will
+not attach a second executor. The error identifies the owning process and tells
+you how to enable the inbox.
+
 ## Why bridge them?
 
 Two coding agents on one machine usually leave you copy-pasting between two
