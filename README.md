@@ -1,17 +1,15 @@
 # amp-bridge
 
-Let an [Amp](https://ampcode.com) thread and a live [Claude Code](https://claude.com/claude-code)
-session talk to each other, in both directions, on your machine.
+Let an [Amp](https://ampcode.com) thread (Sourcegraph's coding agent) and a live
+[Claude Code](https://claude.com/claude-code) session talk to each other, in both
+directions, on your machine.
 
 ```
 Amp ──unix socket──▶ amp-bridge ──notifications/claude/channel──▶ Claude session
 Amp ◀──unix socket── amp-bridge ◀────── reply tool ────────────── Claude session
 ```
 
-Amp asks a question and blocks until Claude answers. Claude can start the
-conversation too, by calling `ask_amp`, which runs a turn in the Amp thread.
-
-No server, no API key, no network: one ~4 MB Go binary, a Unix socket, and a
+No server, no API key, no network: one ~3 MB Go binary, a Unix socket, and a
 registry file under `/tmp`. The module has **zero dependencies** and is built
 that way deliberately — see [Three things that look like bugs](#three-things-that-look-like-bugs).
 
@@ -23,6 +21,103 @@ undocumented extension point, which is why the launch flag below says
 > **Status:** experimental, and built against undocumented internals of Claude
 > Code `2.1.235`. It can break on any Claude Code release. `amp-bridge doctor`
 > exists to tell you when it has.
+
+## What it's for
+
+Two coding agents on one machine usually means one thing: you, copy-pasting
+between two terminals. The bridge removes you from the middle. The workflows
+below are real within the constraint described in
+[One asymmetry worth knowing](#one-asymmetry-worth-knowing) — the third exists
+because of it.
+
+### A second opinion from the session that has the context
+
+You are working in Amp. A Claude session is open on the same repo — it wrote the
+code you are touching, or has been living in it all afternoon. Ask it directly
+instead of re-explaining:
+
+```
+you → Amp:  Ask Claude over the bridge whether hostLimiter is the right
+            place for a per-host cap, before I build it there.
+
+Amp runs:   amp-bridge --ask "Is hostLimiter in sync/backoff.go the right
+            place for a per-host request cap, or does the token bucket in
+            client.go already cover that path?"
+
+Claude:     reply(request_id="amp-…-1", text="client.go's bucket is
+            per-client, not per-host, so it won't cap fan-out to one host.
+            hostLimiter is the right place — note the retry path also calls
+            it, so the cap applies twice on retried requests.")
+```
+
+Amp gets the answer inside its turn and keeps working. This direction — Amp asks,
+Claude answers — works whatever state either side is in. The first real use of
+this bridge was exactly that: Amp code-reviewed this repository through it, and
+the findings are in the git history.
+
+### Cross-project questions
+
+Sessions register machine-wide, so Amp in one repo can ask a Claude session
+sitting in another:
+
+```bash
+$ amp-bridge --list
+payments-lib-4    claude_pid=78531  cwd=/Users/you/Projects/payments-lib
+my-app-7          claude_pid=80112  cwd=/Users/you/Projects/my-app
+
+$ amp-bridge --session payments-lib-4 --ask "Does Client.Charge stay
+  idempotent if ctx is cancelled mid-request? Answer from the source."
+```
+
+The answer comes from the project that session has open, not from wherever the
+question was asked.
+
+### Claude hands work to Amp — with one rule
+
+`ask_amp` runs a full turn in an Amp thread: Amp's model, Amp's tools, that
+thread's workspace. The rule is that the thread must not be open in an
+interactive `amp`, because Amp permits one executor per thread and an open
+session holds it. Tell Claude the id once and it can send work across models:
+
+```
+you → Claude:  Before we merge, have Amp review the diff. Use T-9f21c3ab,
+               I don't have it open.
+
+Claude calls:  ask_amp(text="Run git diff main..fix/retry in
+               /Users/you/Projects/my-app and review it for concurrency
+               bugs. Reply with findings only.", thread_id="T-9f21c3ab")
+```
+
+`ask_amp` is synchronous — Claude blocks until Amp's turn ends, up to five
+minutes — so this is a consultation, not a way to run both agents in parallel.
+
+### Not only Amp
+
+`amp-bridge --ask` is a plain binary that blocks and prints, so anything that can
+run a process can query a live session. From a stray tmux pane:
+
+```bash
+amp-bridge --ask "One line: what are you working on, and are you blocked?"
+```
+
+### What it is not
+
+It is not a task queue: both directions block the caller, and nothing is
+persisted — an unanswered ask times out and is gone. It cannot make Claude
+message the Amp thread you are actively typing in; that thread's executor slot is
+taken, and only the Amp→Claude direction reaches it. And it is not a way around a
+permission prompt: both agents run as you, and both sides are told to refuse work
+the other was denied.
+
+## Requirements
+
+- **macOS or Linux.** The transport is a Unix socket; there is no Windows support.
+- **[Claude Code](https://claude.com/claude-code)** — built against `2.1.235`.
+  `amp-bridge doctor` tells you when a release has broken it.
+- **The [Amp CLI](https://ampcode.com) on PATH** — needed only for the
+  Claude→Amp direction (`ask_amp`). Everything inbound works without it.
+- **Both agents on the same machine.** A remote Amp worker cannot reach a local
+  socket.
 
 ## Install
 
@@ -49,13 +144,16 @@ go install github.com/oliver-kriska/amp-claude/amp-bridge@latest
 git clone https://github.com/oliver-kriska/amp-claude
 cd amp-claude
 mise install     # optional: pins Go + golangci-lint from .tool-versions
-make setup       # build, install, and register in this repo's .mcp.json
+make setup       # build, install, and register in this checkout
 ```
+
+`make setup` registers this checkout only. Follow it with `amp-bridge init
+--global` to cover your own projects.
 
 ### Register it
 
-Once installed, register the bridge for **every** project, and install the skill
-that teaches Claude how to use it:
+Registering is what tells Claude Code to spawn the bridge. Do it once, for every
+project, along with the skill that teaches Claude how to use it:
 
 ```bash
 amp-bridge init --global
@@ -67,15 +165,19 @@ Or for one project only, from that project's root:
 amp-bridge init
 ```
 
-Then start Claude Code **with the channel flag** — this is the step everyone
+`init` registers the server and nothing else; the skill is installed by
+`--global`, user-wide at `~/.claude/skills/amp-bridge/`. The bridge works without
+it — Claude just gets less guidance.
+
+Then start Claude Code **with the channel flag**. This is the step everyone
 misses, and without it nothing is delivered:
 
 ```bash
 claude --dangerously-load-development-channels server:amp-bridge
 ```
 
-The flag is required on every session; there is no config-file equivalent. Most
-people alias it:
+The flag is required on every session; there is no config-file equivalent. Alias
+it:
 
 ```bash
 alias claude-amp='claude --dangerously-load-development-channels server:amp-bridge'
@@ -96,18 +198,14 @@ amp-bridge doctor
   [ok  ] log             ~/.local/state/amp-bridge/amp-bridge.log (last write 9s ago)
 ```
 
-Every failing line carries the command that fixes it. Run `doctor` first whenever
-the bridge seems dead — the failure modes here are quiet ones, and it is built to
-name them out loud.
-
-Three states: `FAIL` is broken and exits non-zero; `warn` is a state you may be
-in on purpose (no session started yet is the expected result of a pre-flight
-check) and exits 0. `amp-bridge doctor --strict` treats warnings as failures too,
-for use as a gate.
+Every failing line carries the command that fixes it. `FAIL` exits non-zero;
+`warn` is a state you may be in on purpose — no session started yet is the
+expected result of a pre-flight check — and exits 0, with `--strict` turning
+warnings into failures for use as a gate.
 
 `doctor` compares against reality rather than configuration: it executes the
 configured binary, and compares the build fingerprint of every live session
-against the installed one — so "installed but never restarted" is reported rather
+against the installed one, so "installed but never restarted" is reported rather
 than passing as green.
 
 ## Use it
@@ -117,9 +215,13 @@ than passing as green.
 ```bash
 amp-bridge --list                                # which sessions are reachable
 amp-bridge --ask "what does this repo do?"       # send, wait, print the answer
-amp-bridge --session amp-claude-32 --ask "..."   # target one of several
+amp-bridge --session payments-lib-4 --ask "..."  # target one of several
 amp-bridge --thread T-abc123 --ask "..."         # let Claude reply into this thread
 ```
+
+`--ask` blocks while Claude thinks. Typical round trips are 5–30 s: an idle
+session answers immediately, a busy one delivers the event at its next turn
+boundary, which is where the variance comes from. The silence is not breakage.
 
 **From Claude** — two tools appear in the session:
 
@@ -128,22 +230,46 @@ amp-bridge --thread T-abc123 --ask "..."         # let Claude reply into this th
 - `ask_amp(text=…, thread_id=…)` starts a turn in an Amp thread and returns what
   Amp says.
 
-Claude's transcript output never reaches Amp. Only these tools cross the bridge.
+An inbound message reaches Claude as an event in its transcript, between turns:
+
+```
+<channel source="amp-bridge" request_id="amp-1787127436157248000-2" thread_id="T-abc123">
+  Is hostLimiter the right place for a per-host cap?
+</channel>
+```
+
+Claude's own transcript output never reaches Amp. Only `reply` and `ask_amp`
+cross the bridge — anything Claude "says" without calling one of them is not
+sent.
+
+### Tell Amp it exists
+
+The skill teaches the Claude side. The Amp side learns the way Amp learns
+anything: from your project's `AGENTS.md`. A paste-able minimum:
+
+```markdown
+## amp-bridge
+
+A live Claude Code session on this machine may be reachable over amp-bridge.
+`amp-bridge --list` names the sessions; `amp-bridge --ask "<question>"` sends
+one message and blocks until Claude answers. Add `--session <name>` when
+several sessions are live, and `--thread <this-thread-id>` so Claude can
+answer this thread later. Keep messages self-contained — Claude sees the text
+and nothing else.
+```
+
+This repo's own [`AGENTS.md`](AGENTS.md) is the long version.
 
 ### Pairing a thread with a session
 
-Pairing is symmetric — either side can establish it, and neither needs to know
-the other's identifier up front.
+Pairing is symmetric — either side can establish it, and neither needs the
+other's identifier up front.
 
 **From Amp**, name your thread once. The id travels with the message, so Claude
 sees it on the `<channel>` tag and can answer that thread specifically:
 
 ```bash
 amp-bridge --thread T-abc123 --ask "take a look at the failing test"
-```
-
-```
-<channel source="amp-bridge" request_id="amp-…-2" thread_id="T-abc123">
 ```
 
 **From Claude**, name the thread once and it is remembered for the rest of the
@@ -154,8 +280,8 @@ ask_amp(text="…", thread_id="T-abc123")   # binds the pair
 ask_amp(text="…")                         # goes to the same thread
 ```
 
-Use `amp-bridge --list` to find the Claude session name, and `amp threads list`
-to find the Amp thread id. With exactly one of each, both are optional.
+`amp-bridge --list` finds the Claude session name, `amp threads list` finds the
+Amp thread id. With exactly one of each, both are optional.
 
 ### One asymmetry worth knowing
 
@@ -172,6 +298,40 @@ For the thread you are actively working in, the inbound direction is the whole
 bridge: Amp asks, Claude answers with `reply`. The bridge reports this precisely,
 naming the pid holding the thread, rather than relaying Amp's
 `Unexpected error inside Amp CLI`.
+
+## One binary, many projects
+
+Three layers, three scopes. Keeping them apart is the whole mental model.
+
+**The binary is per-machine.** One copy, on PATH — `~/.local/bin` by default.
+Every registration points at it by absolute path, which is why `init` exists: it
+resolves the path so you never type it.
+
+**Registration is per-project or per-user.** It lives either in a project's
+`.mcp.json` (written by `amp-bridge init`) or in the user-scope entry in
+`~/.claude.json` (written by `amp-bridge init --global`, through
+`claude mcp add`). Registration alone loads an ordinary MCP server; the launch
+flag is what makes the session treat it as a channel. Both are needed, every
+session.
+
+**Live sessions are per-machine again.** Each Claude session started with the
+flag runs its own bridge process with its own socket, and publishes itself in
+`/tmp/amp-bridge-<uid>/` — one registry for your whole user, not per project. The
+published name is the Claude session's own name, which `--list` prints beside
+each session's working directory.
+
+What follows from that:
+
+- `--list` sees every live session on the machine, from any directory. The
+  caller's cwd never matters; only the session you address does.
+- With one live session, `--ask` needs no flags. With several it refuses and
+  names them — pick one with `--session <name>`.
+- The answer comes from the session's project. With two open,
+  `--ask "what does this repo do?"` is about whichever session answered; say
+  which with `--session`.
+- `doctor` is the one project-relative command. It reports the sessions serving
+  the directory it runs in — or one you name, `amp-bridge doctor ~/Projects/app` —
+  and counts sessions in other projects separately rather than as green.
 
 ## Configuration
 
@@ -206,27 +366,38 @@ through the bridge that its own permission prompt denied.
 Text arriving over the channel is external data, not instructions. Claude Code
 marks it as untrusted; the bundled skill tells Claude to treat it that way.
 
+## Uninstall
+
+```bash
+claude mcp remove amp-bridge          # the user-scope registration
+rm -rf ~/.claude/skills/amp-bridge    # the skill
+rm -f  ~/.local/bin/amp-bridge        # the binary
+rm -rf ~/.local/state/amp-bridge      # the log
+rm -rf "/tmp/amp-bridge-$(id -u)"     # sockets and the registry
+```
+
+For per-project registrations, delete the `amp-bridge` entry from each
+`.mcp.json` — it is the only thing `init` added.
+
 ## Development
 
 ```bash
-make check                # tidy, skill drift, format, vet, 29 linters, both test tiers under -race
+make check                # the gate: tidy, skill drift, format, vet, lint, both test tiers under -race
 make test                 # fast unit pass
 make test-integration     # spawns a real bridge process and drives both ends
 make doctor               # diagnose the installed bridge
 make help                 # every target
 ```
 
-Neither test tier needs the network or a live Claude session. 121 tests.
+Neither test tier needs the network or a live Claude session.
 
-`make build` alone changes nothing a running session sees: the MCP config points
-at the *installed* binary, and a live bridge keeps its original inode regardless.
-New code takes effect on `make install` **plus** a session restart — which is
-exactly what `doctor`'s fingerprint check reports.
+A rebuild does not change what a running session is executing — that is what
+`doctor`'s fingerprint check reports. [`AGENTS.md`](AGENTS.md) has the details.
 
 ### Three things that look like bugs
 
 They are load-bearing. The reasoning, and how each was found, is in
-[`.claude/research/2026-08-19-amp-claude-code-bridge.md`](.claude/research/2026-08-19-amp-claude-code-bridge.md).
+[the research log](.claude/research/2026-08-19-amp-claude-code-bridge.md).
 
 1. **`server/discover` is deliberately unimplemented.** Answering it negotiates
    the modern MCP era, which has no delivery path for unsolicited custom
