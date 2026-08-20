@@ -571,7 +571,13 @@ func TestProcessClientListAndAsk(t *testing.T) {
 	p.handshake()
 	p.socketPath() // wait until it has registered
 
-	listOut, err := exec.Command(p.bin, "--list").CombinedOutput()
+	// p.env matters: without it --list reads the ambient AMP_BRIDGE_DIR instead
+	// of this harness's, so on a developer machine it finds their own live
+	// session and passes while testing nothing. On CI there is no such session
+	// and it fails, which is how this was found.
+	listCmd := exec.Command(p.bin, "--list")
+	listCmd.Env = p.env
+	listOut, err := listCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("--list failed: %v: %s", err, listOut)
 	}
