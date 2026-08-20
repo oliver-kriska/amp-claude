@@ -1,32 +1,62 @@
 # amp-bridge
 
-Let an [Amp](https://ampcode.com) thread (Sourcegraph's coding agent) and a live
-[Claude Code](https://claude.com/claude-code) session talk to each other, in both
-directions, on your machine.
+<p align="center">
+  <img src="docs/assets/amp-bridge-mascot.png" width="320" alt="amp-bridge mascot connecting two local agent endpoints">
+</p>
 
+<p align="center"><strong>Let an Amp thread and a live Claude Code session talk directly on your machine.</strong></p>
+
+```text
+Amp thread  ◀──── Unix socket ────▶  amp-bridge  ◀──── Claude channel ────▶  Claude Code
 ```
-Amp ──unix socket──▶ amp-bridge ──notifications/claude/channel──▶ Claude session
-Amp ◀──unix socket── amp-bridge ◀────── reply tool ────────────── Claude session
+
+No copy-paste relay. No additional server, API key, or network hop. The bridge is
+a small, dependency-free Go binary using a per-user Unix socket and local
+registry under `/tmp`.
+
+It registers as a Claude Code [channel](https://code.claude.com/docs/en/channels-reference):
+an MCP server allowed to push an event into a running session and receive a
+correlated reply.
+
+> **Status:** experimental and live-tested against Claude Code `2.1.235`.
+> Custom channels still require a development launch flag, and their contract
+> may change between Claude Code releases. `amp-bridge doctor` detects the
+> breakages that otherwise fail silently.
+
+## Quick start
+
+Install the latest release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/oliver-kriska/amp-claude/main/install.sh | sh
 ```
 
-No server, no API key, no network: one ~3 MB Go binary, a Unix socket, and a
-registry file under `/tmp`. The module has **zero dependencies** and is built
-that way deliberately — see [Three things that look like bugs](#three-things-that-look-like-bugs).
+Register the channel for all Claude Code projects, then start a session with it:
 
-It works by registering as a Claude Code **channel**: an MCP server permitted to
-push unsolicited events into a running session. Channels are an experimental,
-undocumented extension point, which is why the launch flag below says
-`--dangerously-load-development-channels`.
+```bash
+amp-bridge init --global
+claude --dangerously-load-development-channels server:amp-bridge
+```
 
-> **Status:** experimental, and built against undocumented internals of Claude
-> Code `2.1.235`. It can break on any Claude Code release. `amp-bridge doctor`
-> exists to tell you when it has.
+From Amp or another shell:
 
-## What it's for
+```bash
+amp-bridge --list
+amp-bridge --ask "Reply with exactly PONG"
+```
 
-Two coding agents on one machine usually means one thing: you, copy-pasting
-between two terminals. The bridge removes you from the middle. The workflows
-below are real within the constraint described in
+If the second command prints `PONG`, the complete request/reply path works. If
+it does not, run `amp-bridge doctor`; every failing check includes its fix.
+
+The long flag is required because Claude Code only loads a custom local channel
+server when you explicitly opt into development channels. It is not a request
+to bypass either agent's normal tool permissions.
+
+## Why bridge them?
+
+Two coding agents on one machine usually leave you copy-pasting between two
+terminals. The bridge removes you from the middle. The workflows below are real
+within the constraint described in
 [One asymmetry worth knowing](#one-asymmetry-worth-knowing) — the third exists
 because of it.
 
@@ -119,9 +149,9 @@ the other was denied.
 - **Both agents on the same machine.** A remote Amp worker cannot reach a local
   socket.
 
-## Install
+## Installation options
 
-**Prebuilt binary** (macOS and Linux, amd64 and arm64):
+The quick start uses the **prebuilt binary** for macOS or Linux, amd64 or arm64:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/oliver-kriska/amp-claude/main/install.sh | sh

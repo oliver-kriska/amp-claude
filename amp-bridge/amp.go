@@ -55,14 +55,9 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 	if b.cfg.ampDisabled {
 		return "", errOutboundDisabled
 	}
-	if threadID == "" {
-		threadID = b.knownThread()
-	}
-	if threadID == "" {
-		return "", errNoThread
-	}
-	if !threadIDRE.MatchString(threadID) {
-		return "", fmt.Errorf("implausible Amp thread id %q", threadID)
+	threadID, err := b.resolveThread(threadID)
+	if err != nil {
+		return "", err
 	}
 	if strings.TrimSpace(text) == "" {
 		return "", errEmptyText
@@ -74,10 +69,34 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 	// the pair and Claude had to repeat the id on every call.
 	b.rememberThread(threadID)
 
+	// Logged here, not at the call site: by this point an empty request has been
+	// resolved through knownThread(), and a log line reading thread="" cannot be
+	// classified after the fact.
+	b.logf("ASK_AMP thread=%s bytes=%d", threadID, len(text))
+
+	// A thread open in an interactive Amp session cannot be reached by `threads
+	// continue`: Amp allows one executor per thread and that session holds it.
+	// If the session has a plugin inbox enabled, deliver through it instead.
+	// Absence falls through to the CLI path below, byte for byte unchanged.
+	entry, viaInbox, err := b.lookupInbox(threadID)
+	if err != nil {
+		// A refusal to trust the runtime directory is not "nothing is running",
+		// and must not quietly become a fallback.
+		return "", err
+	}
+
 	// One Amp turn at a time: concurrent `threads continue` runs against the
 	// same thread would interleave writes into one conversation.
 	b.askMu.Lock()
 	defer b.askMu.Unlock()
+
+	if viaInbox {
+		// Final — deliberately no CLI fallback on error. The CLI would hit
+		// EXECUTOR_ALREADY_CONNECTED anyway, since a thread with a live inbox is
+		// by construction open, and once the ask frame is written the message may
+		// already be appended. A loud error beats a possible double delivery.
+		return b.askViaInbox(entry, threadID, text)
+	}
 
 	// Derived from the bridge context, not Background: on shutdown the Amp
 	// subprocess must die with us rather than linger as an orphan.
@@ -88,11 +107,20 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 	// ("Unexpected error inside Amp CLI"); the actual cause is only in the log,
 	// and pointing it at a private file keeps us out of the shared one, which
 	// other amp processes are writing to concurrently.
-	ampLog := ""
+	//
+	// Keep it when the failure turns out to be one we cannot explain: deleting
+	// the only evidence of an undiagnosed failure is how a bug becomes
+	// unreproducible. Every other path removes it.
+	ampLog, keepLog := "", false
 	if f, err := os.CreateTemp("", "amp-bridge-run-*.log"); err == nil {
 		ampLog = f.Name()
 		_ = f.Close()
-		defer func() { _ = os.Remove(ampLog) }()
+		defer func() {
+			if keepLog {
+				return
+			}
+			_ = os.Remove(ampLog)
+		}()
 	}
 
 	args := []string{"threads", "continue", threadID, "--execute", text}
@@ -108,7 +136,7 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 	// Never inherit our stdin: that is the MCP transport.
 	cmd.Stdin = nil
 
-	err := cmd.Run()
+	err = cmd.Run()
 	out := strings.TrimSpace(stdout.String())
 	errOut := strings.TrimSpace(stderr.String())
 
@@ -119,15 +147,9 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 		return out, errors.New("bridge is shutting down; the Amp turn was cancelled")
 	}
 	if err != nil {
-		// The log knows what stderr will not say.
-		if why := ampDiagnosis(ampLog); why != "" {
-			b.logf("AMP_FAILED thread=%s %s", threadID, why)
-			return out, fmt.Errorf("amp failed: %s", why)
-		}
-		if errOut != "" {
-			return out, fmt.Errorf("amp failed: %w: %s", err, truncate(errOut, 2000))
-		}
-		return out, fmt.Errorf("amp failed: %w", err)
+		keep, failure := b.ampFailure(err, threadID, ampLog, errOut)
+		keepLog = keep
+		return out, failure
 	}
 	// Some Amp builds report on stderr while leaving stdout empty; prefer any
 	// output at all over returning nothing.
@@ -135,6 +157,54 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 		return errOut, nil
 	}
 	return out, nil
+}
+
+// resolveThread turns the caller's (possibly empty) thread id into the one that
+// will actually be used, or explains why there isn't one.
+//
+// Empty means "the thread this bridge is paired with", which is how pairing
+// works from the Claude side: name the thread once, then omit it.
+func (b *bridge) resolveThread(threadID string) (string, error) {
+	if threadID == "" {
+		threadID = b.knownThread()
+	}
+	if threadID == "" {
+		return "", errNoThread
+	}
+	if !threadIDRE.MatchString(threadID) {
+		return "", fmt.Errorf("implausible Amp thread id %q", threadID)
+	}
+	return threadID, nil
+}
+
+// ampFailure explains a non-zero amp exit as precisely as the evidence allows,
+// and reports whether amp's log must be kept.
+//
+// The keep decision is the point. Amp's stderr on failure is famously
+// "Unexpected error inside Amp CLI", which classifies nothing; the cause is only
+// ever in its log. Deleting that log after failing to read anything useful out
+// of it leaves a failure that can be counted but never explained — which is
+// exactly what happened to four real runs before this existed.
+func (b *bridge) ampFailure(runErr error, threadID, ampLog, errOut string) (bool, error) {
+	if why := ampDiagnosis(ampLog); why != "" {
+		b.logf("AMP_FAILED thread=%s %s", threadID, why)
+		return false, fmt.Errorf("amp failed: %s", why)
+	}
+
+	b.logf("AMP_UNDIAGNOSED thread=%s log=%s stderr=%q", threadID, ampLog, truncate(errOut, 300))
+	detail := errOut
+	if detail == "" {
+		detail = runErr.Error()
+	}
+	if ampLog != "" {
+		return true, fmt.Errorf("amp failed and its log did not say why: %s "+
+			"(amp's own log kept at %s — that file is the only record of the cause)",
+			truncate(detail, 2000), ampLog)
+	}
+	if errOut != "" {
+		return false, fmt.Errorf("amp failed: %w: %s", runErr, truncate(errOut, 2000))
+	}
+	return false, fmt.Errorf("amp failed: %w", runErr)
 }
 
 func truncate(s string, n int) string {
@@ -179,9 +249,11 @@ func ampDiagnosis(logPath string) string {
 			who = "an Amp session (pid " + m[1] + ")"
 		}
 		return "that thread is already open in " + who + " — Amp allows one " +
-			"executor per thread, so ask_amp cannot attach a second one. Ask from " +
-			"that session instead (it can reach this bridge with `amp-bridge --ask`), " +
-			"or pass thread_id for a thread nobody has open"
+			"executor per thread, so ask_amp cannot attach a second one. Install the " +
+			"inbox plugin (`amp-bridge init --amp-plugin`) and press Ctrl+O in that " +
+			"session → 'amp-bridge: Enable Claude inbox for this thread', and ask_amp " +
+			"reaches it directly. Otherwise ask from that session (it can reach this " +
+			"bridge with `amp-bridge --ask`), or pass thread_id for a thread nobody has open"
 	}
 
 	if m := ampErrorMessageRE.FindStringSubmatch(log); m != nil {

@@ -74,9 +74,42 @@ skill-check: ## Fail if the embedded skill has drifted
 	@diff -q .claude/skills/$(BIN)/SKILL.md amp-bridge/skill.md >/dev/null || \
 		{ echo "amp-bridge/skill.md is stale: run 'make skill'"; exit 1; }
 
+# The Amp plugin is embedded in the binary for `go install` users, and a copy is
+# committed under .amp/plugins/ so this repo's own Amp sessions load it. An
+# installed artefact quietly older than the build that reads it is this
+# project's signature failure, so the two are gated against each other.
+.PHONY: plugin
+plugin: ## Sync the committed Amp plugin from the embedded source
+	cp amp-bridge/plugin/amp-bridge-inbox.ts .amp/plugins/amp-bridge-inbox.ts
+
+.PHONY: plugin-check
+plugin-check: ## Fail if the committed Amp plugin has drifted
+	@diff -q amp-bridge/plugin/amp-bridge-inbox.ts .amp/plugins/amp-bridge-inbox.ts >/dev/null || \
+		{ echo ".amp/plugins/amp-bridge-inbox.ts is stale: run 'make plugin'"; exit 1; }
+
+# The plugin is 750 lines of TypeScript that Amp executes, and Go's linters
+# cannot see a word of it. Type-checking it against Amp's own published .d.ts is
+# the only gate that catches a wrong property name or a handler with the wrong
+# return type — the first run of this found exactly that in agent.start.
+.PHONY: plugin-typecheck
+plugin-typecheck: ## Type-check the Amp plugin against Amp's published types
+	@command -v bun >/dev/null || { \
+		echo "bun missing: run 'mise install' (pinned in .tool-versions)"; exit 1; }
+	@cd amp-bridge/plugin && bun install --silent && bunx tsc --noEmit
+
 .PHONY: setup-global
-setup-global: install ## Register the bridge and skill for all projects
+setup-global: install ## Register the bridge, skill and Amp plugin for all projects
 	@"$(BINDIR)/$(BIN)" init --global
+	@"$(BINDIR)/$(BIN)" init --amp-plugin --global
+
+# Zero external dependencies does not mean zero vulnerabilities: govulncheck
+# reports stdlib CVEs reachable from this code, which is the only supply chain
+# this binary has.
+.PHONY: vuln
+vuln: ## Check for known vulnerabilities (stdlib included)
+	@command -v govulncheck >/dev/null 2>&1 || { \
+		echo "govulncheck missing: go install golang.org/x/vuln/cmd/govulncheck@latest"; exit 1; }
+	@govulncheck ./...
 
 .PHONY: doctor
 doctor: ## Diagnose the installed bridge against $(PROJECT)
@@ -123,7 +156,7 @@ tidy: ## Verify go.mod is tidy
 	$(GO) mod tidy -diff
 
 .PHONY: check
-check: tidy skill-check fmt-check vet lint test test-integration ## Everything above
+check: tidy skill-check plugin-check plugin-typecheck fmt-check vet lint vuln test test-integration ## Everything above
 	@echo "all checks passed"
 
 .PHONY: tools

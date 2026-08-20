@@ -1,0 +1,23 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "amp-bridge-inbox",
+      "devDependencies": {
+        "@ampcode/plugin": "0.0.0-20260820001044-g4608ace",
+        "@types/node": "^26.0.0",
+        "typescript": "^5.9.0",
+      },
+    },
+  },
+  "packages": {
+    "@ampcode/plugin": ["@ampcode/plugin@0.0.0-20260820001044-g4608ace", "", {}, "sha512-3GAuA3vdsKk6LWxtN+3Xepd2jE/sl+BItlsESmOFQNMn/TQ7Y5rNUR/EqWcGLukgobnMtd2gAzlcG9j4h5uA0w=="],
+
+    "@types/node": ["@types/node@26.2.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg=="],
+
+    "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
+
+    "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
+  }
+}

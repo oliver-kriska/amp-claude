@@ -1,0 +1,10 @@
+{
+  "name": "amp-bridge-inbox",
+  "private": true,
+  "description": "Type-checking only. The plugin ships as a single .ts file embedded in the Go binary; nothing here is installed at runtime or by users.",
+  "devDependencies": {
+    "@ampcode/plugin": "0.0.0-20260820001044-g4608ace",
+    "@types/node": "^26.0.0",
+    "typescript": "^5.9.0"
+  }
+}

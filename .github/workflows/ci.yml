@@ -24,6 +24,16 @@ jobs:
         with:
           version: 2026.8.1
 
-      # tidy, skill drift, formatting, go vet on both build tags, 29 linters,
-      # and both test tiers under -race. Same command a contributor runs.
+      # Not pinned in .tool-versions because it is a checker rather than part of
+      # the build: nothing it reports changes the artefact, and pinning it would
+      # mean freezing the vulnerability database along with the tool.
+      - name: Install govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # tidy, skill and plugin drift, TypeScript type-check against Amp's
+      # published types, formatting, go vet on both build tags, 29 linters,
+      # stdlib vulnerabilities, and both test tiers under -race. Same command a
+      # contributor runs.
       - run: make check

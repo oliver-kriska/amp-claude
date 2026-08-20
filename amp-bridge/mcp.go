@@ -423,8 +423,6 @@ func (b *bridge) handleAskAmp(id, args json.RawMessage) {
 		b.fail(id, errInvalidParams, "invalid ask_amp arguments: "+err.Error())
 		return
 	}
-	b.logf("ASK_AMP thread=%q bytes=%d", a.ThreadID, len(a.Text))
-
 	out, err := b.askAmp(a.ThreadID, a.Text)
 	if err != nil {
 		b.logf("ASK_AMP_FAILED %v", err)

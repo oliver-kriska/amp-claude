@@ -264,3 +264,117 @@ func TestAskAmpDoesNotRememberARejectedThread(t *testing.T) {
 		t.Errorf("remembered a rejected id: %q", got)
 	}
 }
+
+// fakeAmpLogAware is fakeAmp for tests that care about the --log-file argument
+// rather than the positional ones: it keeps the path in $AMPLOG before shifting,
+// so the script can write into the log the bridge will later read (or refuse to
+// delete). $MARKER receives that path so the test can check the file's fate.
+func fakeAmpLogAware(t *testing.T, script string) string {
+	t.Helper()
+	dir := shortTempDir(t)
+	path := filepath.Join(dir, "amp")
+	preamble := "#!/bin/sh\n" +
+		"AMPLOG=\"\"\n" +
+		"if [ \"$1\" = \"--log-file\" ]; then AMPLOG=\"$2\"; shift 2; fi\n" +
+		"if [ -n \"$MARKER\" ]; then printf '%s' \"$AMPLOG\" > \"$MARKER\"; fi\n"
+	if err := os.WriteFile(path, []byte(preamble+script+"\n"), 0o755); err != nil {
+		t.Fatalf("write fake amp: %v", err)
+	}
+	return path
+}
+
+// An undiagnosed failure must keep amp's log. Deleting the only record of a
+// failure nobody can explain is how "Unexpected error inside Amp CLI" stayed
+// unclassifiable across four real runs.
+func TestAskAmpKeepsAmpLogWhenItCannotDiagnose(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "logpath")
+	t.Setenv("MARKER", marker)
+
+	// A log with nothing diagnosable in it, and amp's trademark useless stderr.
+	bin := fakeAmpLogAware(t, `printf '{"level":"INFO","message":"nothing useful"}\n' > "$AMPLOG"
+echo "Unexpected error inside Amp CLI." >&2
+exit 1`)
+	h := newHarness(t, func(c *config) {
+		c.ampDisabled = false
+		c.ampBin = bin
+		c.ampTimeout = 60 * time.Second
+	})
+
+	_, err := h.b.askAmp("T-42", "hi")
+	if err == nil {
+		t.Fatal("askAmp must fail when amp exits non-zero")
+	}
+	if !strings.Contains(err.Error(), "did not say why") {
+		t.Errorf("error must admit the failure is undiagnosed, got %q", err)
+	}
+
+	kept, readErr := os.ReadFile(marker)
+	if readErr != nil {
+		t.Fatalf("stub did not record the log path: %v", readErr)
+	}
+	logPath := string(kept)
+	if logPath == "" {
+		t.Fatal("bridge did not pass --log-file")
+	}
+	// The point of the change: the evidence survives.
+	if _, statErr := os.Stat(logPath); statErr != nil {
+		t.Errorf("amp's log was deleted despite an undiagnosed failure: %v", statErr)
+	}
+	// And the caller is told where to look.
+	if !strings.Contains(err.Error(), logPath) {
+		t.Errorf("error must name the kept log %q, got %q", logPath, err)
+	}
+}
+
+// The mirror image: when the failure IS diagnosed, the log has served its
+// purpose and must not accumulate in the temp directory.
+func TestAskAmpRemovesAmpLogOnceDiagnosed(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "logpath")
+	t.Setenv("MARKER", marker)
+
+	bin := fakeAmpLogAware(t, `printf '{"level":"ERROR","message":"EXECUTOR_ALREADY_CONNECTED","existingExecutorInfo":{"pid":4242}}\n' > "$AMPLOG"
+echo "Unexpected error inside Amp CLI." >&2
+exit 1`)
+	h := newHarness(t, func(c *config) {
+		c.ampDisabled = false
+		c.ampBin = bin
+		c.ampTimeout = 60 * time.Second
+	})
+
+	_, err := h.b.askAmp("T-42", "hi")
+	if err == nil {
+		t.Fatal("askAmp must fail when amp exits non-zero")
+	}
+	if !strings.Contains(err.Error(), "pid 4242") {
+		t.Fatalf("diagnosis must name the holder, got %q", err)
+	}
+
+	kept, readErr := os.ReadFile(marker)
+	if readErr != nil {
+		t.Fatalf("stub did not record the log path: %v", readErr)
+	}
+	if _, statErr := os.Stat(string(kept)); statErr == nil {
+		t.Errorf("a diagnosed failure must not leave %s behind", string(kept))
+	}
+}
+
+// The bridge log must record the thread that was actually used. Logging the
+// requested id left real entries reading thread="" that could never afterwards
+// be attributed to a thread.
+func TestAskAmpLogsTheResolvedThread(t *testing.T) {
+	t.Parallel()
+	h := ampHarness(t, `echo ok`)
+
+	h.b.rememberThread("T-remembered")
+	if _, err := h.b.askAmp("", "hi"); err != nil {
+		t.Fatalf("askAmp: %v", err)
+	}
+
+	logged := h.log.String()
+	if !strings.Contains(logged, "ASK_AMP thread=T-remembered") {
+		t.Errorf("log must name the resolved thread, got %q", logged)
+	}
+	if strings.Contains(logged, `thread=""`) {
+		t.Error(`log still records the unresolved thread="" form`)
+	}
+}

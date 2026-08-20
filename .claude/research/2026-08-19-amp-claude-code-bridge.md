@@ -1088,22 +1088,114 @@ testing what it claimed".
 
 ---
 
+## 20. The spike: Claude → live Amp thread, proved (rev. 14)
+
+**2026-08-20. The mechanism the whole plugin design rested on works.** Until today,
+`ask_amp` reaching a thread that is open in an interactive Amp session was an inference from
+API shape. It is now an observation.
+
+### What was run
+
+A 332-line throwaway plugin, `.amp/plugins/amp-bridge-spike.ts` (gitignored), holding the
+H-1 scope and nothing else: one fixed socket, one enabled thread, one `ask` at a time, marker
+match on `agent.start`, capture on `agent.end`, answer back down the socket, dispose. No
+registry, no doctor, no installer, no queue, no lane state machine, no CLI fallback, no
+validation table — deliberately, so that a failure could only be the mechanism.
+
+Driven by a plain socket client, never by `ask_amp`. Two unproven things in one loop cannot
+be told apart.
+
+### Result
+
+```
+09:15:35.211  APPEND_TRY     req=spike7335 thread=T-01a01877-…
+09:15:35.215  APPEND_OK      req=spike7335 thread=T-01a01877-…
+09:15:37.634  START_MATCHED  id=M-034ALYJdB7iV3JEZ7YLNOe req=spike7335
+09:15:52.386  END_CAPTURED   id=M-034ALYJdB7iV3JEZ7YLNOe req=spike7335 status=done messages=4 assistants=2
+09:15:52.386  RESPONDED      req=spike7335 bytes=42
+```
+
+Client received: `{"id":"spike7335","reply":"module github.com/oliver-kriska/amp-claude"}` —
+the correct first line of `go.mod`, in 17 s end to end (2.4 s append→start, 14.8 s
+start→end).
+
+**Assumption 1 (§A of the plan) is settled affirmatively:**
+`amp.threads.get(threadID).appendUserMessage()` **works from a socket callback, on a thread
+the plugin did not receive through an event context.** The cached-`ctx.thread` variant was
+never needed and was not run.
+
+### `assistants=2` is the important number
+
+The turn used tools and produced **two** assistant messages. That is what makes this a real
+test of Amp's review correction B: joining every assistant message would have returned the
+intermediate commentary ahead of the answer, and a single-message turn could not have
+distinguished the two implementations. The naive version was in the draft plan and would have
+shipped.
+
+### Failure modes, all observed naming themselves
+
+| Probe | Response |
+|---|---|
+| malformed JSON | `{"error":"malformed json"}`, `BAD_JSON` logged |
+| unknown op | `{"error":"unknown op: frobnicate"}` |
+| nonexistent thread | `append failed: … 403 {"error":"Thread not found or access denied"}`, request released, no hang |
+| idle connection, no frame | `IDLE_CLOSE` after 10 s |
+
+### Three findings that change the plan
+
+1. **A fresh `amp` CLI has no thread at all until the first message is sent.** So
+   `ctx.thread === undefined` is the *normal first-run experience*, not an edge case, and a
+   bare "no active thread" reads as a malfunction. Folded into B-2: the message must say
+   "send a message in this session first", and the palette entry should probably be
+   `disabled` with that reason while no thread exists.
+
+2. **Two Amp sessions in one project run two plugin host processes, and they collided.** Both
+   loaded the project plugin; the second called `listen()` on the same fixed `spike.sock`,
+   unlinked the first's socket and took it over. The first process kept its in-memory
+   inflight and correlated its turn correctly, but its client could never have been answered.
+   This is exactly risk 6, and it **validates the per-pid socket naming**
+   (`plugin-<pid>.sock`) already in D — the spike's fixed name is the thing that broke, and
+   the real design does not have it. Additional note for D: `startServer` must never unlink a
+   socket that belongs to another live process; per-pid naming makes that inherent, which is
+   another reason not to "simplify" it later.
+
+3. **`nc` is the wrong client and produces a false negative.** On stdin EOF it closes the
+   connection before the reply arrives, so the first run logged `RESPONDED bytes=42` while
+   the caller saw nothing. Anything documenting this needs a client that waits for the
+   response, not a pipe into `nc`. Worth a line in the README's troubleshooting section,
+   because it will otherwise be reported as "the bridge doesn't reply".
+
+### Status
+
+H-1 exit criteria (a) text arrives on the client, (b) proved on a tool-using turn, (c) each
+earlier stage's failure mode seen at least once — **all met**. (d) was not needed.
+
+Everything after this point is hardening, not hope. Steps 2–8 of the plan are ordinary work.
+
 ## Open questions
 
-1. ~~Which protocol era must a channel server negotiate?~~ **Answered:** Claude proposes `2025-11-25`
-   (modern, no delivery path); server must negotiate down. Whether `2025-06-18` is accepted by the
-   client's negotiator is the remaining half.
-2. ~~Console or Teams/Enterprise?~~ **Answered:** neither — `claude_max`, and channels are
-   policy-blocked pending a managed-settings file.
-3. ~~Payload schema~~ **Partially answered:** `content` + `_meta`, injected as a `next`-priority
-   prompt; `/permission` carries `request_id`. The reply direction (what tool shape Claude expects to
-   call back through) is still unverified — the probe exposes `reply_to_amp` to find out.
-4. Does the client accept a server-initiated downgrade to `2025-06-18`, or does it hard-fail /
-   re-offer? If it refuses, `MCP_PROTOCOL_NEGOTIATION=legacy` on the Claude side is the fallback lever.
-5. Can `crossSessionInbound` be scoped per-project? (`localSettings`/`projectSettings`/`repoSettings`
-   are all in the chain, so probably.)
-6. Behaviour when the bridge's Amp thread is mid-turn — does `amp threads continue --execute` queue or
-   reject?
+Questions 1–4 of earlier revisions concerned the MCP protocol-era negotiation and the reply
+tool shape. **All are closed** — the bridge has been in daily use since rev. 11, the legacy
+era is negotiated successfully, and `reply` has carried many round trips including the review
+in §20. They are removed rather than left struck through; the changelog preserves the history.
+
+Still open:
+
+1. **Can `crossSessionInbound` be scoped per-project?** (`localSettings`/`projectSettings`/
+   `repoSettings` are all in the chain, so probably.) Unchanged, still unverified.
+2. **Queued-append turn shape.** When a bridge message is appended while a human turn is
+   running, does it get its own turn or is it coalesced into the current one? Undocumented,
+   and §20 did not settle it — the spike's appends all landed on idle threads. Marker
+   correlation works either way, but the behaviour changes what the human sees. Tier-3
+   check 3 of the plugin plan.
+3. **Should a channel request carry its own deadline?** A timed-out request currently
+   vanishes and the answering side only discovers it when it tries to reply; `reply` is
+   one-shot per id, so there is no holding message. Raising `AMP_BRIDGE_TIMEOUT` moves the
+   cliff without making it visible. Deferred by agreement as a follow-up, not a plugin
+   blocker. See the drop file `2026-08-20-agent-channel-reply-window.md`.
+4. **Two Amp hosts, one project.** §20 finding 2 showed they collide on a fixed socket path.
+   Per-pid naming should keep their sockets and thread registries isolated, but that is
+   reasoned, not observed — Amp has asked for it as a live acceptance check.
 
 ## Method note
 

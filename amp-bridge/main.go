@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,6 +54,9 @@ type options struct {
 	dir     string
 	strict  bool
 	global  bool
+	// ampPlugin installs the Amp-side half; force overwrites a divergent copy.
+	ampPlugin bool
+	force     bool
 }
 
 const usage = `amp-bridge — bridge an Amp thread to a Claude Code session
@@ -60,6 +64,11 @@ const usage = `amp-bridge — bridge an Amp thread to a Claude Code session
   amp-bridge                            run as an MCP stdio server (Claude spawns this)
   amp-bridge init [dir]                 write .mcp.json pointing at this binary
   amp-bridge init --global              register for every project, plus the skill
+  amp-bridge init --amp-plugin [dir]    install the Amp plugin into one project, so
+                                        ask_amp can reach a thread that is open
+  amp-bridge init --amp-plugin --global install it for every Amp session
+                                        (~/.config/amp/plugins), still off until
+                                        enabled per thread
   amp-bridge doctor [dir] [--strict]    diagnose why the channel is not working
   amp-bridge --list                     list live bridges
   amp-bridge [--session N] [--thread T] --ask "text"
@@ -139,6 +148,10 @@ func parseSubcommand(args []string) (options, bool) {
 			o.strict = true
 		case "--global":
 			o.global = true
+		case "--amp-plugin":
+			o.ampPlugin = true
+		case "--force":
+			o.force = true
 		default:
 			o.dir = a
 		}
@@ -157,6 +170,10 @@ func subcommandError(args []string) error {
 			continue
 		case a == "--global" && args[0] == "init":
 			continue
+		case a == "--amp-plugin" && args[0] == "init":
+			continue
+		case a == "--force" && args[0] == "init":
+			continue
 		case strings.HasPrefix(a, "-"):
 			return fmt.Errorf("%s does not take %s", args[0], a)
 		default:
@@ -165,6 +182,11 @@ func subcommandError(args []string) error {
 	}
 	if dirs > 1 {
 		return fmt.Errorf("%s takes at most one directory", args[0])
+	}
+	// A directory with --global is a contradiction. Ignoring it is how a user
+	// ends up believing they installed something into a path that was never touched.
+	if dirs > 0 && args[0] == "init" && slices.Contains(args[1:], "--global") {
+		return errors.New("init --global installs for every project, so it takes no directory")
 	}
 	return nil
 }
@@ -190,6 +212,14 @@ func run(args []string) int {
 	case modeAsk:
 		return cmdAsk(cfg, opts.session, opts.thread, opts.text)
 	case modeInit:
+		// --amp-plugin names the artefact, --global names the scope, so the
+		// artefact is selected first. Checking global first meant that
+		// `init --amp-plugin --global` silently registered the Claude MCP server
+		// and installed no plugin at all — a typed flag being dropped without a
+		// word, which is the exact failure class this binary keeps designing out.
+		if opts.ampPlugin {
+			return cmdInitAmpPlugin(opts.dir, opts.global, opts.force)
+		}
 		if opts.global {
 			return cmdInitGlobal()
 		}

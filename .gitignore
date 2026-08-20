@@ -11,3 +11,10 @@
 # amp-bridge/, so the binary cannot share that name.
 /bin/
 /coverage.out
+
+# Throwaway spike plugin (see .claude/research/2026-08-20-amp-bridge-inbox-plugin-plan.md H-1).
+# The real plugin ships embedded in the binary and its installed copy IS committed.
+.amp/plugins/amp-bridge-spike.ts
+
+# Type-checking only for the Amp plugin; nothing here ships.
+amp-bridge/plugin/node_modules/

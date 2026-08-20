@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -58,6 +59,8 @@ func cmdDoctor(cfg config, dir string, strict bool) int {
 		checkMCPConfig(dir),
 		checkRuntimeDir(),
 		checkLiveSessions(dir),
+		checkPluginInboxes(),
+		checkInstalledPlugin(dir),
 		checkAmpCLI(cfg),
 		checkLog(),
 	}
@@ -436,4 +439,175 @@ func firstLine(b []byte) string {
 		s = s[:i]
 	}
 	return truncate(s, 120)
+}
+
+// checkPluginInboxes reports which Amp threads have opened their Claude inbox,
+// and sweeps entries whose plugin is gone.
+//
+// Absence is never a failure. The plugin is an optional component: most projects
+// will not have one, and a doctor that cries about a feature nobody installed
+// teaches people to ignore it. What this catches is the state that *is* wrong —
+// an entry that looks live but is not, which would otherwise surface later as an
+// ask_amp failure with no obvious cause.
+func checkPluginInboxes() check {
+	const name = "plugin inboxes"
+
+	dir, err := trustedInboxDir()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return check{name, statusOK, "none (no thread has enabled its Claude inbox)", ""}
+		}
+		return check{
+			name, statusFail, err.Error(),
+			"the inbox directory cannot be trusted — remove it and re-enable in Amp",
+		}
+	}
+	threads, err := trustedSubdir(dir, "threads")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return check{name, statusOK, "none (no thread has enabled its Claude inbox)", ""}
+		}
+		return check{
+			name, statusFail, err.Error(),
+			"the inbox directory cannot be trusted — remove it and re-enable in Amp",
+		}
+	}
+
+	files, err := filepath.Glob(filepath.Join(threads, "*.json"))
+	if err != nil {
+		return check{name, statusWarn, err.Error(), ""}
+	}
+	if len(files) == 0 {
+		return check{name, statusOK, "none (no thread has enabled its Claude inbox)", ""}
+	}
+
+	var live, stale []string
+	for _, f := range files {
+		ok, desc := classifyInbox(f)
+		if desc == "" {
+			continue
+		}
+		if ok {
+			live = append(live, desc)
+		} else {
+			stale = append(stale, desc)
+		}
+	}
+
+	switch {
+	case len(stale) == 0:
+		return check{name, statusOK, strings.Join(live, ", "), ""}
+	case len(live) == 0:
+		return check{
+			name, statusWarn,
+			"stale: " + strings.Join(stale, ", "),
+			"those Amp sessions are gone or reloaded — re-enable the inbox there (Ctrl+O)",
+		}
+	default:
+		return check{
+			name, statusWarn,
+			strings.Join(live, ", ") + "; stale: " + strings.Join(stale, ", "),
+			"re-enable the inbox in the Amp sessions listed as stale (Ctrl+O)",
+		}
+	}
+}
+
+// classifyInbox decides whether one inbox entry is really serving its thread,
+// sweeping it when it is not. It returns ("", "") for an entry it cannot read at
+// all, which is neither evidence of health nor worth reporting.
+//
+// A live socket is not sufficient evidence: onDispose does not run on SIGKILL,
+// and a pid-named path could be reused by a later plugin process. Only the
+// status handshake proves the plugin behind the socket still serves this thread.
+func classifyInbox(path string) (live bool, desc string) {
+	// #nosec G304 -- path comes from our own glob of our own 0700 inbox tree.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, ""
+	}
+	var e inboxEntry
+	if json.Unmarshal(data, &e) != nil {
+		_ = os.Remove(path)
+		return false, filepath.Base(path) + " (unreadable)"
+	}
+	if !socketIsLive(e.Socket) {
+		_ = os.Remove(path) // the session is gone; the entry is noise
+		return false, e.ThreadID
+	}
+	st, err := inboxStatus(context.Background(), e.Socket)
+	switch {
+	case err != nil:
+		return false, e.ThreadID + " (unresponsive)"
+	case st.Proto != inboxProto:
+		return false, fmt.Sprintf("%s (protocol v%d, want v%d)", e.ThreadID, st.Proto, inboxProto)
+	case !slices.Contains(st.EnabledThreads, e.ThreadID):
+		return false, e.ThreadID + " (plugin no longer serves it)"
+	default:
+		return true, fmt.Sprintf("%s (plugin pid %d)", e.ThreadID, e.PluginPID)
+	}
+}
+
+// checkInstalledPlugin compares a project's installed Amp plugin against the one
+// embedded in this binary.
+//
+// Absent is fine — the plugin is optional and most projects will not have it.
+// What matters is a copy that exists and is stale, because that is invisible:
+// Amp loads it happily, the socket appears, and only the protocol handshake or a
+// missing field eventually gives it away.
+func checkInstalledPlugin(dir string) check {
+	const name = "amp plugin"
+	want := pluginDigest()
+
+	type site struct {
+		label, path, force string
+	}
+	sites := []site{
+		{
+			"this project", filepath.Join(dir, ".amp", "plugins", pluginFileName),
+			"amp-bridge init --amp-plugin --force",
+		},
+	}
+	if g, err := ampGlobalPluginDir(); err == nil {
+		sites = append(sites, site{
+			"all Amp sessions", filepath.Join(g, pluginFileName),
+			"amp-bridge init --amp-plugin --global --force",
+		})
+	}
+
+	var good, stale []string
+	var fix string
+	for _, s := range sites {
+		have, ok := fileDigest(s.path)
+		switch {
+		case !ok:
+			continue
+		case have == want:
+			good = append(good, s.label)
+		default:
+			stale = append(stale, fmt.Sprintf("%s (%s, this build embeds %s)", s.label, have, want))
+			if fix == "" {
+				fix = "run `" + s.force + "`, then reload it in Amp"
+			}
+		}
+	}
+
+	switch {
+	case len(good) == 0 && len(stale) == 0:
+		// Optional component. Say where it would go rather than warning about
+		// its absence: a cross-project user needs the global form, and finding
+		// that out only by failing to enable an inbox is the DX bug we just hit.
+		return check{
+			name, statusOK,
+			"not installed (optional — `init --amp-plugin` per project, or `--amp-plugin --global` for all)", "",
+		}
+	case len(stale) == 0:
+		return check{name, statusOK, "installed for " + strings.Join(good, " and "), ""}
+	case len(good) == 0:
+		return check{name, statusWarn, "stale: " + strings.Join(stale, "; "), fix}
+	default:
+		return check{
+			name, statusWarn,
+			"installed for " + strings.Join(good, " and ") + "; stale: " + strings.Join(stale, "; "), fix,
+		}
+	}
 }
