@@ -25,48 +25,56 @@ correlated reply.
 
 ## Quick start
 
-Install the latest release:
+1. **Install** the binary:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/oliver-kriska/amp-claude/main/install.sh | sh
-```
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/oliver-kriska/amp-claude/main/install.sh | sh
+   ```
 
-Set up both directions once, then start a Claude session with the channel:
+2. **Register both sides** — once per machine:
 
-```bash
-amp-bridge init --global               # Claude channel + skill
-amp-bridge init --amp-plugin --global  # Amp inbox plugin
-claude --dangerously-load-development-channels server:amp-bridge
-```
+   ```bash
+   amp-bridge init --global               # Claude channel + skill
+   amp-bridge init --amp-plugin --global  # Amp inbox plugin
+   ```
 
-From Amp or another shell:
+3. **Start Claude Code with the channel** — needed on every session, so
+   [alias it](#register-it):
 
-```bash
-amp-bridge --list
-amp-bridge --ask "Reply with exactly PONG"
-```
+   ```bash
+   claude --dangerously-load-development-channels server:amp-bridge
+   ```
 
-If the second command prints `PONG`, the complete request/reply path works. If
-it does not, run `amp-bridge doctor`; every failing check includes its fix.
-To let Claude initiate into an open Amp thread, send that thread's first message
-and run `Ctrl+O` → `amp-bridge: Enable Claude inbox for this thread` once.
+   The flag opts this session into loading a development channel. It does not
+   loosen either agent's tool permissions.
 
-The long flag is required because Claude Code only loads a custom local channel
-server when you explicitly opt into development channels. It is not a request
-to bypass either agent's normal tool permissions.
+4. **Check it** — from Amp or any shell:
+
+   ```bash
+   amp-bridge --ask "Reply with exactly PONG"
+   ```
+
+   `PONG` means the Amp → Claude round trip works. Anything else: run
+   `amp-bridge doctor`, where every failing check prints its own fix.
+
+5. **Only if Claude should message an Amp thread you have open:** in that
+   thread, run `Ctrl+O` → `amp-bridge: Enable Claude inbox for this thread`.
+
+   Not usable? The two causes look different. **Greyed out** means that session
+   has no thread yet — send its first message. **Missing entirely** means Amp
+   was already running during step 2 — run `Ctrl+O` → `plugins: reload` first.
+
+6. **Confirm the inbox** — `amp-bridge doctor` now lists that thread under
+   `plugin inboxes`.
+
+Step 4 tested one direction. The full exchange, both ways, is walked through
+[below](#your-first-two-way-conversation).
 
 ## Your first two-way conversation
 
-The channel, the skill and the inbox plugin are separate on purpose. Install
-both sides once:
-
-```bash
-amp-bridge init --global               # Claude channel registration + Claude skill
-amp-bridge init --amp-plugin --global  # Amp inbox plugin
-```
-
-That is the setup cost. Once the pair is established, normal use is two
-plain-language prompts:
+The channel, the skill and the inbox plugin are separate on purpose — the two
+`init` commands in step 2 above install them, and that is the whole setup cost.
+Once the pair is established, normal use is two plain-language prompts:
 
 ```text
 you → Amp:     Use amp-bridge to ask Claude session my-app-review to review auth.go.
