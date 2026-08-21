@@ -390,10 +390,13 @@ export default function (amp: PluginAPI) {
     }
     if (disposed || req.settled || req.turnMsgId !== null) return
 
-    // Unknown state is treated as "busy" deliberately. A failed probe is not
-    // evidence of a stalled thread, and guessing wrong here would abort a turn
-    // that is running perfectly well.
-    if (state === null || String(state) === 'running') {
+    // Only states that prove the thread cannot start our turn are stalled.
+    // `awaiting-approval` is busy just like `running`, and an unknown future
+    // state must stay on the safe side too: a failed probe is not evidence of a
+    // stall, and guessing wrong here would abort a turn that is perfectly well.
+    const stateName = String(state)
+    const stalled = state !== null && (stateName === 'idle' || stateName === 'error')
+    if (!stalled) {
       req.noTurn = setTimeout(() => void checkTurnStarted(threadID, req), noTurnDelay(req))
       return
     }
@@ -402,8 +405,8 @@ export default function (amp: PluginAPI) {
     respond(req, {
       error:
         `the message was appended to thread ${threadID} but Amp did not start a turn ` +
-        `for it (thread state: ${String(state)}). It is sitting in the thread unanswered — ` +
-        `open that thread and reply, or send it again from there`,
+        `for it (thread state: ${String(state)}). It is sitting in the thread unanswered; ` +
+        `ask your user to open that thread and reply there`,
       code: 'no-turn',
     })
     releaseLane(threadID, req)

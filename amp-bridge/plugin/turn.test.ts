@@ -156,6 +156,7 @@ test('the message is reported as already delivered, not lost', async () => {
   const reply = await ask(2000)
   // Resending would duplicate the question, so the caller must be told it landed.
   expect(String(reply.error)).toContain('sitting in the thread unanswered')
+  expect(String(reply.error)).not.toMatch(/send it again|resend it/i)
   await p.dispose()
 })
 
@@ -166,6 +167,37 @@ test('a busy thread is left alone — queued is not stalled', async () => {
 
   const reply = await ask(2000)
   // Must ride out its own timeout rather than being killed by the watchdog.
+  expect(reply.code).toBe('timeout')
+  await p.dispose()
+})
+
+test('a thread awaiting approval is busy, not stalled', async () => {
+  const p = await loadPlugin()
+  await p.enable()
+  p.setState('awaiting-approval')
+
+  const reply = await ask(2000)
+  expect(reply.code).toBe('timeout')
+  await p.dispose()
+})
+
+test('a thread in error fails fast instead of waiting out the deadline', async () => {
+  const p = await loadPlugin()
+  await p.enable()
+  p.setState('error')
+
+  const reply = await ask(2000)
+  expect(reply.code).toBe('no-turn')
+  expect(String(reply.error)).toContain('thread state: error')
+  await p.dispose()
+})
+
+test('an unrecognised future state is treated as busy, never as stalled', async () => {
+  const p = await loadPlugin()
+  await p.enable()
+  p.setState('paused')
+
+  const reply = await ask(2000)
   expect(reply.code).toBe('timeout')
   await p.dispose()
 })
