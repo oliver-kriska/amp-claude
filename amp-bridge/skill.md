@@ -126,6 +126,7 @@ nothing is delivered. `amp-bridge init` repairs that one.
 | `ask_amp`: `has not enabled its Claude inbox` | The plugin is loaded in that Amp session but the thread has not opted in. Only your user can: `Ctrl+O` → `amp-bridge: Enable Claude inbox for this thread`. |
 | `ask_amp`: `already has requests queued` | That thread's inbox is enabled but Amp has not finished earlier turns. Wait; don't retry straight away. |
 | `ask_amp`: `was disabled or the plugin reloaded while the request was in flight` | Delivery is genuinely unknown. Say so, and have the thread checked before anything is resent. |
+| `ask_amp`: `did not start a turn for it` | Your question IS in the thread; Amp just never ran. Do not resend — that duplicates it. Ask your user to open that thread and reply there. |
 
 Server-side log: `~/.local/state/amp-bridge/amp-bridge.log` — `EVENT_PUSHED`, `REPLY_TOOL`,
 `AMP_REPLIED`, `AMP_TIMEOUT`, `AMP_ABANDONED`. It records frame shape, not

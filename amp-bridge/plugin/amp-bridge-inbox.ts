@@ -43,6 +43,10 @@ const TEXT_MAX = 64 * 1024
 const IDLE_MS = 10_000 // a connection that sends no complete frame is closed
 const MAX_CONNS = 32
 const QUEUE_MAX = 4
+// Ceiling on how long after a successful append we wait for Amp to start a turn
+// before checking whether one is ever going to. Generous against the observed
+// healthy case, where agent.start followed the append in about a second.
+const NO_TURN_GRACE_MS = 20_000
 const DEFAULT_TIMEOUT_MS = 240_000
 const MAX_TIMEOUT_MS = 600_000
 const STATE_PROBE_MS = 500 // bounded, so enrichment cannot lose the race it exists to win
@@ -67,6 +71,7 @@ type ReqState = {
   conn: net.Socket | null // null once the caller has gone away
   timer: ReturnType<typeof setTimeout> | null
   orphan: ReturnType<typeof setTimeout> | null
+  noTurn: ReturnType<typeof setTimeout> | null
   turnMsgId: string | number | null
   appended: boolean // lane ownership begins HERE, not at agent.start
   settled: boolean
@@ -133,7 +138,13 @@ export default function (amp: PluginAPI) {
   function log(msg: string): void {
     if (!fs.existsSync(inboxDir)) return
     try {
-      fs.appendFileSync(logPath, `${new Date().toISOString()} ${msg}\n`, { mode: 0o600 })
+      // Every Amp session on this machine appends to this one file, so a line
+      // without a pid cannot be attributed to a session. That cost real time
+      // during the first field diagnosis: three DISPOSE lines that could have
+      // belonged to any of four running Amps.
+      fs.appendFileSync(logPath, `${new Date().toISOString()} [${process.pid}] ${msg}\n`, {
+        mode: 0o600,
+      })
     } catch {
       /* diagnostics must never be the thing that breaks delivery */
     }
@@ -270,6 +281,8 @@ export default function (amp: PluginAPI) {
     req.settled = true
     if (req.timer) clearTimeout(req.timer)
     req.timer = null
+    if (req.noTurn) clearTimeout(req.noTurn)
+    req.noTurn = null
     const conn = req.conn
     req.conn = null
     if (!conn) return
@@ -288,6 +301,8 @@ export default function (amp: PluginAPI) {
     if (!l || l.inflight !== req) return
     if (req.orphan) clearTimeout(req.orphan)
     req.orphan = null
+    if (req.noTurn) clearTimeout(req.noTurn)
+    req.noTurn = null
     l.inflight = null
     const next = l.queue.shift()
     if (next) void startRequest(threadID, next)
@@ -304,10 +319,17 @@ export default function (amp: PluginAPI) {
 
     log(`APPEND_TRY req=${req.id} thread=${threadID} from=${req.from}`)
     try {
-      await amp.threads.get(threadID as never).appendUserMessage({
-        type: 'user-message',
-        content,
-      })
+      await amp.threads.get(threadID as never).appendUserMessage(
+        {
+          type: 'user-message',
+          content,
+        },
+        // The caller is blocked on this with a deadline, so being queued behind
+        // whatever else the thread is doing means timing out with the question
+        // still unread. steer asks Amp to prefer it. Without this, a request
+        // sent while the thread was mid-turn sat unanswered until it expired.
+        { steer: true },
+      )
     } catch (err) {
       // A rejected append does not prove nothing landed, but it is the only
       // signal available, and there is deliberately no second attempt through
@@ -327,6 +349,64 @@ export default function (amp: PluginAPI) {
       log(`ORPHAN req=${req.id} thread=${threadID} — no agent.end within ${ORPHAN_FACTOR}x budget`)
       releaseLane(threadID, req)
     }, req.timeoutMs * ORPHAN_FACTOR)
+
+    // Appending a message is not the same as starting a turn, and discovering
+    // the difference by waiting out the whole timeout tells the caller nothing
+    // about what went wrong. See checkTurnStarted.
+    req.noTurn = setTimeout(() => void checkTurnStarted(threadID, req), noTurnDelay(req))
+  }
+
+  // A caller who allowed two seconds should not wait twenty to be told nothing
+  // started. Scale with their deadline and cap at the ceiling, so a short
+  // request fails fast and a long one still gets a generous grace.
+  function noTurnDelay(req: ReqState): number {
+    return Math.min(NO_TURN_GRACE_MS, Math.max(250, Math.floor(req.timeoutMs / 4)))
+  }
+
+  // Did Amp actually start a turn for the message we appended?
+  //
+  // appendUserMessage resolves when the message is in the thread. Whether a
+  // turn follows is Amp's decision, and in the field it sometimes does not:
+  // the message lands, nothing runs, and the caller waits out the full timeout
+  // for an answer that was never being written. That failure used to be
+  // indistinguishable from a slow turn.
+  //
+  // The thread's own state separates them. Something running means our request
+  // is plausibly queued behind it, which is legitimate — keep waiting, the
+  // request timeout still bounds us. Nothing running, with no turn of ours
+  // started, means nothing is ever going to happen, and the honest answer is to
+  // say so now and name the consequence: the message IS in the thread.
+  async function checkTurnStarted(threadID: string, req: ReqState): Promise<void> {
+    if (disposed || req.settled || req.turnMsgId !== null) return
+
+    let state: unknown = null
+    try {
+      state = await Promise.race([
+        amp.threads.get(threadID as never).state.get(),
+        new Promise((resolve) => setTimeout(() => resolve(null), STATE_PROBE_MS)),
+      ])
+    } catch {
+      /* the probe is a diagnostic; its failure must not settle the request */
+    }
+    if (disposed || req.settled || req.turnMsgId !== null) return
+
+    // Unknown state is treated as "busy" deliberately. A failed probe is not
+    // evidence of a stalled thread, and guessing wrong here would abort a turn
+    // that is running perfectly well.
+    if (state === null || String(state) === 'running') {
+      req.noTurn = setTimeout(() => void checkTurnStarted(threadID, req), noTurnDelay(req))
+      return
+    }
+
+    log(`NO_TURN req=${req.id} thread=${threadID} state=${String(state)}`)
+    respond(req, {
+      error:
+        `the message was appended to thread ${threadID} but Amp did not start a turn ` +
+        `for it (thread state: ${String(state)}). It is sitting in the thread unanswered — ` +
+        `open that thread and reply, or send it again from there`,
+      code: 'no-turn',
+    })
+    releaseLane(threadID, req)
   }
 
   // The text is carried on the request object rather than closed over, so the
@@ -348,6 +428,8 @@ export default function (amp: PluginAPI) {
       return
     }
     req.turnMsgId = event.id
+    if (req.noTurn) clearTimeout(req.noTurn)
+    req.noTurn = null
     log(`START_MATCHED id=${String(event.id)} req=${req.id}`)
     // Returning undefined rather than {}: an AgentStartResult with a `message`
     // would append content to the user's turn, and undefined is the shape both
@@ -479,6 +561,7 @@ export default function (amp: PluginAPI) {
       conn,
       timer: null,
       orphan: null,
+      noTurn: null,
       turnMsgId: null,
       appended: false,
       settled: false,
@@ -805,6 +888,7 @@ export default function (amp: PluginAPI) {
       for (const r of [l.inflight, ...l.queue].filter(Boolean) as ReqState[]) {
         if (r.timer) clearTimeout(r.timer)
         if (r.orphan) clearTimeout(r.orphan)
+        if (r.noTurn) clearTimeout(r.noTurn)
         respond(r, { error: 'the plugin is reloading or unloading', code: 'disabled' })
       }
     }

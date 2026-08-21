@@ -318,6 +318,12 @@ func inboxCodeError(r inboxReply, threadID string) error {
 			"the Claude inbox for %s was disabled or the plugin reloaded while the request "+
 				"was in flight. The message may or may not have reached the thread — check it "+
 				"before resending", threadID)
+	case "no-turn":
+		// Distinct from a timeout: the question is in the thread, so resending
+		// it duplicates rather than retries. Say that plainly — the caller
+		// cannot see the thread and would otherwise assume nothing landed.
+		return fmt.Errorf(
+			"%s — do not resend the same question, it is already there", r.Error)
 	case "turn-error", "turn-cancelled":
 		return fmt.Errorf("the Amp turn %s before answering — check thread %s",
 			strings.TrimPrefix(r.Code, "turn-"), threadID)

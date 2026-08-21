@@ -246,6 +246,9 @@ func TestInboxErrorCodesAreActionable(t *testing.T) {
 		{"turn-error", "before answering"},
 		{"turn-cancelled", "before answering"},
 		{"timeout", "did not finish in time"},
+		// The distinguishing fact is that the question already landed, so the
+		// message must steer the caller away from resending it.
+		{"no-turn", "do not resend"},
 		{"append-failed", "could not append"},
 	} {
 		t.Run(tc.code, func(t *testing.T) {
