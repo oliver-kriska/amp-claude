@@ -371,3 +371,23 @@ func TestEnsureRuntimeDirRefusesANonDirectory(t *testing.T) {
 		t.Error("a plain file in place of the runtime dir must be refused")
 	}
 }
+
+// TestSuiteNeverResolvesTheRealRuntimeDir is the guard on TestMain.
+//
+// runtimeDir falls back to /tmp/amp-bridge-<uid> whenever AMP_BRIDGE_DIR is
+// unset, and that fallback is silent — a test that forgets the variable does
+// not fail, it quietly consults the developer's live sockets and plugin
+// registrations. That already happened twice: once in CI, where a --list
+// assertion passed against a real session, and once here, where every askAmp
+// test read the machine's own inbox directory.
+//
+// So assert the property rather than trusting everyone to remember it. Delete
+// TestMain, or unset the variable in some future helper, and this goes red.
+func TestSuiteNeverResolvesTheRealRuntimeDir(t *testing.T) {
+	real := fmt.Sprintf("/tmp/amp-bridge-%d", os.Getuid())
+	if got := runtimeDir(); got == real {
+		t.Fatalf("the test binary resolves the real runtime dir %s — "+
+			"tests would read live sockets and registrations; "+
+			"TestMain must point AMP_BRIDGE_DIR somewhere private", got)
+	}
+}

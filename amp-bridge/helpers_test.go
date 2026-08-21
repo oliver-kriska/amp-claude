@@ -3,11 +3,44 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// TestMain gives the whole binary a runtime directory of its own.
+//
+// The runtime dir is resolved from the process environment deep inside the call
+// stack — ownRuntimeDir, reached from trustedInboxDir and friends — so a test
+// that does not set AMP_BRIDGE_DIR reads the DEVELOPER'S real one. That was
+// harmless while it held only sockets, and stopped being harmless once
+// lookupInbox started reading live plugin registrations out of it: askAmp tests
+// then consult whatever Amp sessions happen to be running on the machine, and
+// their outcome depends on the state of somebody's afternoon.
+//
+// The same shape already reached CI once, where a --list assertion passed
+// against the developer's own live session and failed the moment it ran
+// somewhere clean. Setting it here means no test can reach the real directory
+// by omission; a test that wants a specific one still overrides it.
+func TestMain(m *testing.M) {
+	// Short base path: a Unix socket path is capped near 104 bytes, and the
+	// default macOS temp dir eats most of that before a filename.
+	dir, err := os.MkdirTemp("/tmp", "ampb-suite")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "test runtime dir:", err)
+		os.Exit(1)
+	}
+	if err := os.Setenv("AMP_BRIDGE_DIR", dir); err != nil {
+		fmt.Fprintln(os.Stderr, "set AMP_BRIDGE_DIR:", err)
+		os.Exit(1)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 // syncBuf is an io.Writer safe to read while the bridge writes to it.
 type syncBuf struct {
