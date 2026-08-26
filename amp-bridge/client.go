@@ -14,7 +14,7 @@ import (
 // Client mode: the same binary, used from the Amp side to talk to a running
 // bridge over its Unix socket.
 
-func cmdList() int {
+func cmdList(verbose bool) int {
 	bridges, err := listBridges()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "amp-bridge: %v\n", err)
@@ -26,8 +26,21 @@ func cmdList() int {
 	}
 	for _, e := range bridges {
 		fmt.Printf("%-28s  claude_pid=%-7d  cwd=%s\n", e.Name, e.ClaudePID, e.CWD)
+		if verbose {
+			fmt.Printf("  bridge_pid=%d  session_id=%s  version=%s  build=%s\n",
+				e.BridgePID, valueOrDash(e.SessionID), valueOrDash(e.Version), valueOrDash(e.Fingerprint))
+			fmt.Printf("  handshake=%s  started=%s  socket=%s\n",
+				valueOrDash(e.InitializedAt), valueOrDash(e.StartedAt), e.Socket)
+		}
 	}
 	return 0
+}
+
+func valueOrDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func pickBridge(want string) (registryEntry, error) {
@@ -38,7 +51,8 @@ func pickBridge(want string) (registryEntry, error) {
 	if len(bridges) == 0 {
 		return registryEntry{}, errors.New(
 			"no live amp-bridge sessions.\n" +
-				"Is a Claude Code session running with the channel loaded?")
+				"Is a Claude Code session running with the channel loaded?",
+		)
 	}
 	if want != "" {
 		for _, e := range bridges {
@@ -52,7 +66,8 @@ func pickBridge(want string) (registryEntry, error) {
 	if len(bridges) > 1 {
 		return registryEntry{}, fmt.Errorf(
 			"%d live bridges — pass --session <name> to choose: %s",
-			len(bridges), strings.Join(bridgeNames(bridges), ", "))
+			len(bridges), strings.Join(bridgeNames(bridges), ", "),
+		)
 	}
 	return bridges[0], nil
 }

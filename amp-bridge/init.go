@@ -94,7 +94,8 @@ func loadMCPConfig(path string) (doc map[string]any, previous any, existed bool,
 		target, _ := os.Readlink(path)
 		return nil, nil, false, fmt.Errorf(
 			"%s is a symlink to %s — refusing to write through it; "+
-				"remove the link if you want a real file here", path, target)
+				"remove the link if you want a real file here", path, target,
+		)
 	}
 
 	doc = map[string]any{}
@@ -115,7 +116,8 @@ func loadMCPConfig(path string) (doc map[string]any, previous any, existed bool,
 	}
 	if doc == nil {
 		return nil, nil, false, fmt.Errorf(
-			"%s contains JSON null, not an object — refusing to overwrite it", path)
+			"%s contains JSON null, not an object — refusing to overwrite it", path,
+		)
 	}
 
 	raw, present := doc["mcpServers"]
@@ -123,7 +125,8 @@ func loadMCPConfig(path string) (doc map[string]any, previous any, existed bool,
 	if present && !ok {
 		return nil, nil, false, fmt.Errorf(
 			"%s has an \"mcpServers\" key that is not an object (%T) — "+
-				"refusing to replace it", path, raw)
+				"refusing to replace it", path, raw,
+		)
 	}
 	if servers == nil {
 		servers = map[string]any{}

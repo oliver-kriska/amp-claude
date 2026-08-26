@@ -17,8 +17,8 @@ import (
 	"time"
 )
 
-// The Amp plugin inbox: the path by which ask_amp reaches a thread that is
-// *open* in an interactive Amp session.
+// The Amp plugin inbox: the path by which Claude's outbound tools reach a thread
+// that is *open* in an interactive Amp session.
 //
 // Amp permits one executor per thread, so `amp threads continue --execute`
 // cannot attach to a thread somebody is sitting in — see §18 of the research
@@ -27,8 +27,8 @@ import (
 // plugin's socket, checks it is really serving the thread we want, and speaks
 // the newline-delimited JSON protocol the plugin implements.
 //
-// Absence is not an error. When no inbox exists, askAmp falls through to the CLI
-// and behaves exactly as it did before this file existed.
+// Absence is not an error. When no inbox exists, delivery falls through to the
+// CLI and behaves exactly as it did before this file existed.
 
 const (
 	// inboxProto is the wire version this build speaks. A plugin announcing a
@@ -103,13 +103,15 @@ func trustedSubdir(parent, name string) (string, error) {
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		if uid := os.Getuid(); int(st.Uid) != uid {
 			return "", fmt.Errorf(
-				"%s is owned by uid %d, not %d — refusing to use it", path, st.Uid, uid)
+				"%s is owned by uid %d, not %d — refusing to use it", path, st.Uid, uid,
+			)
 		}
 	}
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
 		return "", fmt.Errorf(
 			"%s is mode %04o — group/other access must be off (chmod 700 %s)",
-			path, perm, path)
+			path, perm, path,
+		)
 	}
 	return path, nil
 }
@@ -129,8 +131,8 @@ func trustedInboxDir() (string, error) {
 	return trustedSubdir(dir, "inbox")
 }
 
-// newRequestID returns the 12 lowercase hex characters that identify one request
-// and, as `amp-bridge-req-<id>`, the marker the plugin correlates turns by.
+// newRequestID returns a short random suffix used for inbox requests and async
+// handles. Randomness keeps ids distinct across concurrent bridge processes.
 func newRequestID() (string, error) {
 	var b [6]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -141,7 +143,7 @@ func newRequestID() (string, error) {
 
 // inboxStatus performs the status handshake on its own short-lived connection.
 //
-// Deliberately separate from the ask connection. The fallback rule in askAmp
+// Deliberately separate from the ask connection. The fallback rule in delivery
 // turns on whether any `ask` bytes could have been accepted; probing and
 // delivering over one connection would make that unprovable after the fact.
 func inboxStatus(ctx context.Context, sock string) (inboxStatusReply, error) {
@@ -231,7 +233,8 @@ func (b *bridge) lookupInbox(threadID string) (inboxEntry, bool, error) {
 		return inboxEntry{}, false, fmt.Errorf(
 			"the installed Amp plugin speaks inbox protocol v%d, this bridge expects v%d — "+
 				"run `amp-bridge init --amp-plugin` and reload the plugin in Amp",
-			st.Proto, inboxProto)
+			st.Proto, inboxProto,
+		)
 	}
 	if !slices.Contains(st.EnabledThreads, threadID) {
 		b.logf("INBOX_MISMATCH thread=%s socket=%s serves=%v", threadID, e.Socket, st.EnabledThreads)
@@ -260,6 +263,11 @@ func (b *bridge) askViaInbox(e inboxEntry, threadID, text string) (string, error
 		return "", fmt.Errorf("plugin inbox for %s did not accept a connection: %w", threadID, err)
 	}
 	defer func() { _ = conn.Close() }()
+	// A deadline alone does not react when the bridge shuts down. Close the
+	// connection on context cancellation so synchronous and background asks
+	// unwind instead of holding shutdown until the socket deadline.
+	stopCancel := context.AfterFunc(b.ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 
 	// Slightly past the plugin's own deadline, so its diagnosis arrives first.
 	if err := conn.SetDeadline(time.Now().Add(b.cfg.ampTimeout + inboxTimeoutLead)); err != nil {
@@ -277,19 +285,27 @@ func (b *bridge) askViaInbox(e inboxEntry, threadID, text string) (string, error
 	}
 	b.logf("INBOX_ASK thread=%s req=%s pid=%d bytes=%d", threadID, id, e.PluginPID, len(text))
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		if b.ctx.Err() != nil {
+			return "", errors.New("bridge is shutting down; the Amp turn was cancelled")
+		}
 		// Ambiguous by construction: some bytes may have been accepted.
 		return "", fmt.Errorf(
 			"writing to the plugin inbox failed partway (%w). The message may or may not "+
-				"have reached thread %s — check it before resending", err, threadID)
+				"have reached thread %s — check it before resending", err, threadID,
+		)
 	}
 
 	var r inboxReply
 	if err := json.NewDecoder(conn).Decode(&r); err != nil {
+		if b.ctx.Err() != nil {
+			return "", errors.New("bridge is shutting down; the Amp turn was cancelled")
+		}
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return "", fmt.Errorf(
 				"the plugin inbox closed mid-request (the Amp session may have exited or "+
 					"reloaded its plugins). The message may or may not have reached thread %s "+
-					"— check it before resending", threadID)
+					"— check it before resending", threadID,
+			)
 		}
 		return "", fmt.Errorf("reading the plugin inbox reply failed: %w", err)
 	}
@@ -308,22 +324,26 @@ func inboxCodeError(r inboxReply, threadID string) error {
 	case "not-enabled":
 		return fmt.Errorf(
 			"thread %s has not enabled its Claude inbox — press Ctrl+O in that Amp session "+
-				"and run 'amp-bridge: Enable Claude inbox for this thread'", threadID)
+				"and run 'amp-bridge: Enable Claude inbox for this thread'", threadID,
+		)
 	case "busy":
 		return fmt.Errorf(
 			"the Claude inbox for %s already has requests queued — Amp has not finished the "+
-				"earlier turns yet", threadID)
+				"earlier turns yet", threadID,
+		)
 	case "disabled":
 		return fmt.Errorf(
 			"the Claude inbox for %s was disabled or the plugin reloaded while the request "+
 				"was in flight. The message may or may not have reached the thread — check it "+
-				"before resending", threadID)
+				"before resending", threadID,
+		)
 	case "no-turn":
 		// Distinct from a timeout: the question is in the thread, so resending
 		// it duplicates rather than retries. Say that plainly — the caller
 		// cannot see the thread and would otherwise assume nothing landed.
 		return fmt.Errorf(
-			"%s — do not resend the same question, it is already there", r.Error)
+			"%s — do not resend the same question, it is already there", r.Error,
+		)
 	case "turn-error", "turn-cancelled":
 		return fmt.Errorf("the Amp turn %s before answering — check thread %s",
 			strings.TrimPrefix(r.Code, "turn-"), threadID)

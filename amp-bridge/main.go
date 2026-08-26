@@ -54,6 +54,7 @@ type options struct {
 	text    string
 	dir     string
 	strict  bool
+	verbose bool
 	global  bool
 	// ampPlugin installs the Amp-side half; force overwrites a divergent copy.
 	ampPlugin bool
@@ -66,25 +67,25 @@ const usage = `amp-bridge — bridge an Amp thread to a Claude Code session
   amp-bridge init [dir]                 write .mcp.json pointing at this binary
   amp-bridge init --global              register for every project, plus the skill
   amp-bridge init --amp-plugin [dir]    install the Amp plugin into one project, so
-                                        ask_amp can reach a thread that is open
+                                        Claude can reach a thread that is open
   amp-bridge init --amp-plugin --global install it for every Amp session
                                         (~/.config/amp/plugins), still off until
                                         enabled per thread
   amp-bridge doctor [dir] [--strict]    diagnose why the channel is not working
-  amp-bridge --list                     list live bridges
+  amp-bridge --list [--verbose]         list live bridges; include build and handshake details
   amp-bridge --version                  print the version and build fingerprint
   amp-bridge [--session N] [--thread T] --ask "text"
 
 Environment:
-  AMP_BRIDGE_MAX_INFLIGHT   unanswered events allowed        (default 8)
+  AMP_BRIDGE_MAX_INFLIGHT   inbound and async caps           (default 8 each)
   AMP_BRIDGE_MAX_BYTES      max bytes per message            (default 65536)
   AMP_BRIDGE_TIMEOUT        how long a caller waits          (default 3m0s)
-  AMP_BRIDGE_AMP_TIMEOUT    how long ask_amp waits           (default 5m0s)
+  AMP_BRIDGE_AMP_TIMEOUT    how long ask_amp/send_amp waits  (default 2m0s)
   AMP_BRIDGE_LOG            log file (default ~/.local/state/amp-bridge/amp-bridge.log)
   AMP_BRIDGE_LOG_BODIES     1 to log frame bodies (contains conversation text)
   AMP_BRIDGE_DIR            runtime/registry directory
   AMP_BRIDGE_SOCKET         explicit socket path
-  AMP_BRIDGE_DISABLE_OUTBOUND  1 to disable the ask_amp tool
+  AMP_BRIDGE_DISABLE_OUTBOUND  1 to disable Claude→Amp tools
   AMP_BIN                   Amp CLI to invoke                (default "amp")`
 
 // parseArgs is strict: an unrecognised flag is an error rather than a silent
@@ -101,6 +102,8 @@ func parseArgs(args []string) (options, error) {
 		switch args[i] {
 		case "--list":
 			o.mode = modeList
+		case "--verbose":
+			o.verbose = true
 		case "--help", "-h":
 			o.mode = modeHelp
 			return o, nil
@@ -118,6 +121,9 @@ func parseArgs(args []string) (options, error) {
 			}
 			i++
 		case "--ask":
+			if o.verbose {
+				return o, errors.New("--verbose is only valid with --list")
+			}
 			// Everything after --ask is the message, so it need not be quoted.
 			o.mode = modeAsk
 			o.text = strings.TrimSpace(strings.Join(args[i+1:], " "))
@@ -128,6 +134,9 @@ func parseArgs(args []string) (options, error) {
 		default:
 			return o, fmt.Errorf("unknown argument %q (try --help)", args[i])
 		}
+	}
+	if o.verbose && o.mode != modeList {
+		return o, errors.New("--verbose is only valid with --list")
 	}
 	return o, nil
 }
@@ -220,8 +229,16 @@ func run(args []string) int {
 		fmt.Printf("amp-bridge %s (build %s)\n", serverVersion, buildFingerprint())
 		return 0
 	case modeList:
-		return cmdList()
+		return cmdList(opts.verbose)
 	case modeAsk:
+		if opts.thread != "" && !canonicalThreadIDRE.MatchString(opts.thread) {
+			fmt.Fprintf(
+				os.Stderr,
+				"amp-bridge: --thread needs a complete Amp thread id like T-01a01877-2274-734d-8306-7c37b33f2a7f; got %q\n",
+				opts.thread,
+			)
+			return 2
+		}
 		return cmdAsk(cfg, opts.session, opts.thread, opts.text)
 	case modeInit:
 		// --amp-plugin names the artefact, --global names the scope, so the
@@ -378,9 +395,9 @@ func runServer(cfg config) int {
 
 // drainToolWork cancels in-flight tool calls and waits briefly for them.
 //
-// Tool calls run off the read loop, so an ask_amp subprocess may still be
-// mid-turn when Claude closes stdin. Without this, `amp threads continue`
-// outlives the session as an orphan.
+// Tool calls run off the read loop, so an ask_amp or send_amp subprocess may
+// still be mid-turn when Claude closes stdin. Without this, `amp threads
+// continue` outlives the session as an orphan.
 func (b *bridge) drainToolWork() {
 	b.beginShutdown()
 

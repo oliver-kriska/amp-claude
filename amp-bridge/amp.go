@@ -16,9 +16,9 @@ import (
 // Claude -> Amp direction.
 //
 // The channel gives Claude a way to answer Amp. It gives it no way to *start* a
-// conversation, so on its own the bridge is half-duplex. This closes that by
-// shelling out to the Amp CLI, which is the only supported way into an existing
-// thread from outside.
+// conversation, so on its own the bridge is half-duplex. The outbound tools
+// close that through a live plugin inbox when available, or the Amp CLI when no
+// interactive session owns the target thread.
 //
 // Thread identity: Amp's client may pass --thread <id>, which we remember. That
 // lets Claude say "ask Amp about X" without knowing the id, while still allowing
@@ -31,15 +31,18 @@ const ampWaitDelay = 2 * time.Second
 
 var (
 	errOutboundDisabled = errors.New(
-		"outbound to Amp is disabled (AMP_BRIDGE_DISABLE_OUTBOUND=1)")
+		"outbound to Amp is disabled (AMP_BRIDGE_DISABLE_OUTBOUND=1)",
+	)
 	errNoThread = errors.New(
 		"no Amp thread id known. Either the Amp side has not sent a message yet " +
-			"(the bridge learns the id from `--thread`), or you must pass thread_id explicitly")
+			"(the bridge learns the id from `--thread`), or you must pass thread_id explicitly",
+	)
 	errEmptyText = errors.New("text is empty")
 
 	// Amp thread ids look like T-01a01877-2274-734d-8306-7c37b33f2a7f. Anything
 	// starting with a dash would be read by the CLI as a flag rather than an id.
-	threadIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	threadIDRE          = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	canonicalThreadIDRE = regexp.MustCompile(`^T-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$`)
 )
 
 func (b *bridge) rememberThread(id string) {
@@ -75,7 +78,34 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 	// naming the thread once. Without this, only the Amp side could establish
 	// the pair and Claude had to repeat the id on every call.
 	b.rememberThread(threadID)
+	return b.deliverToAmp(threadID, text, true)
+}
 
+// askAmpExplicit runs one turn without changing the bridge's remembered pair.
+// send_amp requires this form: concurrent background work must not make a later
+// thread_id-less ask_amp silently target whichever job happened to finish last.
+func (b *bridge) askAmpExplicit(threadID, text string) (string, error) {
+	if b.cfg.ampDisabled {
+		return "", errOutboundDisabled
+	}
+	if strings.TrimSpace(threadID) == "" {
+		return "", errors.New("thread_id is required for send_amp")
+	}
+	if !threadIDRE.MatchString(threadID) {
+		return "", fmt.Errorf("implausible Amp thread id %q", threadID)
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", errEmptyText
+	}
+	return b.deliverToAmp(threadID, text, false)
+}
+
+// deliverToAmp chooses the live plugin inbox when one serves the thread and
+// otherwise falls back to the Amp CLI. Callers validate the target first.
+// Synchronous calls serialize the CLI fallback; background calls are already
+// bounded by asyncSlots and must not sit ahead of an ask_amp whose caller has a
+// shorter end-to-end deadline.
+func (b *bridge) deliverToAmp(threadID, text string, serializeCLI bool) (string, error) {
 	// Logged here, not at the call site: by this point an empty request has been
 	// resolved through knownThread(), and a log line reading thread="" cannot be
 	// classified after the fact.
@@ -92,11 +122,6 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 		return "", err
 	}
 
-	// One Amp turn at a time: concurrent `threads continue` runs against the
-	// same thread would interleave writes into one conversation.
-	b.askMu.Lock()
-	defer b.askMu.Unlock()
-
 	if viaInbox {
 		// Final — deliberately no CLI fallback on error. The CLI would hit
 		// EXECUTOR_ALREADY_CONNECTED anyway, since a thread with a live inbox is
@@ -104,6 +129,21 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 		// already be appended. A loud error beats a possible double delivery.
 		return b.askViaInbox(entry, threadID, text)
 	}
+
+	if serializeCLI {
+		// Preserve synchronous call ordering. Background CLI turns bypass this
+		// mutex: they have their own bounded slots, and queueing them here could
+		// hold a foreground ask beyond the caller's reply deadline.
+		b.askMu.Lock()
+		defer b.askMu.Unlock()
+	}
+	if !b.beginCLIThread(threadID) {
+		return "", fmt.Errorf(
+			"another CLI fallback turn for thread %s is already in flight in this bridge; "+
+				"wait for it to finish or enable the thread inbox to queue turns", threadID,
+		)
+	}
+	defer b.endCLIThread(threadID)
 
 	// Derived from the bridge context, not Background: on shutdown the Amp
 	// subprocess must die with us rather than linger as an orphan.
@@ -153,6 +193,22 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 		return errOut, nil
 	}
 	return out, nil
+}
+
+func (b *bridge) beginCLIThread(threadID string) bool {
+	b.cliMu.Lock()
+	defer b.cliMu.Unlock()
+	if _, exists := b.cliActive[threadID]; exists {
+		return false
+	}
+	b.cliActive[threadID] = struct{}{}
+	return true
+}
+
+func (b *bridge) endCLIThread(threadID string) {
+	b.cliMu.Lock()
+	delete(b.cliActive, threadID)
+	b.cliMu.Unlock()
 }
 
 // resolveThread turns the caller's (possibly empty) thread id into the one that

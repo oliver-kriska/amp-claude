@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // MCP stdio transport and request handling.
@@ -38,8 +39,9 @@ const (
 	// handshake. Used only when the client names no version at all.
 	legacyProtocol = "2025-11-25"
 
-	toolReply  = "reply"
-	toolAskAmp = "ask_amp"
+	toolReply   = "reply"
+	toolAskAmp  = "ask_amp"
+	toolSendAmp = "send_amp"
 )
 
 // JSON-RPC error codes we use (per the spec).
@@ -50,9 +52,10 @@ const (
 )
 
 var instruction = "Events from " + serverName + " arrive as <channel source=\"" + serverName +
-	"\" request_id=\"...\">. Anything you want the sender to see must go through the " +
-	"reply tool — your transcript output never reaches the channel. ALWAYS pass the " +
-	"request_id attribute from the event you are answering when you call reply."
+	"\" ...>. Request events carry request_id; anything you want their sender to see must " +
+	"go through the reply tool, passing that exact id. Completion events from send_amp " +
+	"carry async_id instead and require no reply. Your transcript output never reaches " +
+	"the channel."
 
 type rpc struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -103,9 +106,21 @@ type bridge struct {
 	restartBackoff time.Duration
 	socketCheck    time.Duration
 
-	// Amp turns are serialised: two concurrent `threads continue` runs against
-	// one thread would interleave writes to the same conversation.
+	// Synchronous CLI fallback turns are serialised. Background turns bypass the
+	// mutex because asyncSlots already bounds their subprocesses; plugin inbox
+	// turns use the plugin's authoritative per-thread FIFO ordering.
 	askMu sync.Mutex
+	// CLI turns in one bridge may run concurrently only against different
+	// threads. Amp would reject same-thread overlap at the executor boundary with
+	// a misleading "thread is open" diagnosis, so fail it locally instead of
+	// adding a second queue in front of Amp.
+	cliMu     sync.Mutex
+	cliActive map[string]struct{}
+
+	// send_amp returns before its Amp turn completes. asyncSlots bounds that
+	// background work; the handle is carried by the goroutine and completion
+	// event, so no pollable request map or second queue is needed.
+	asyncSlots chan struct{}
 
 	// ctx is cancelled on shutdown. Tool calls run off the read loop, so
 	// without it an `amp threads continue` subprocess outlives the bridge as an
@@ -179,12 +194,14 @@ func (b *bridge) fatalSignal() <-chan struct{} { return b.fatalCh }
 
 func newBridge(cfg config, out, logw io.Writer) *bridge {
 	b := &bridge{
-		cfg:     cfg,
-		out:     bufio.NewWriter(out),
-		logw:    logw,
-		pending: make(map[string]chan string),
-		downCh:  make(chan struct{}),
-		fatalCh: make(chan struct{}),
+		cfg:        cfg,
+		out:        bufio.NewWriter(out),
+		logw:       logw,
+		pending:    make(map[string]chan string),
+		asyncSlots: make(chan struct{}, cfg.maxInFlight),
+		cliActive:  make(map[string]struct{}),
+		downCh:     make(chan struct{}),
+		fatalCh:    make(chan struct{}),
 
 		restartMax:     5,
 		restartWindow:  time.Minute,
@@ -299,13 +316,13 @@ func (b *bridge) dispatch(msg rpc) {
 		b.markInitialized()
 
 	case "tools/list":
-		b.reply(msg.ID, map[string]any{"tools": []any{replyTool, askAmpTool}})
+		b.reply(msg.ID, map[string]any{"tools": []any{replyTool, askAmpTool, sendAmpTool}})
 
 	case "tools/call":
-		// Off the read loop. ask_amp shells out to the Amp CLI for up to five
-		// minutes; handling it inline stalls the whole transport — no ping, no
-		// reply from Claude, not even stdin EOF noticed. JSON-RPC correlates by
-		// id and send is mutex-guarded, so answering out of order is fine.
+		// Off the read loop. An outbound Amp turn can take up to two minutes;
+		// handling it inline stalls the whole transport — no ping, no reply from
+		// Claude, not even stdin EOF noticed. JSON-RPC correlates by id and send
+		// is mutex-guarded, so answering out of order is fine.
 		b.toolWG.Go(func() {
 			if panicked := b.guard("tools/call", func() { b.handleToolsCall(msg) }); panicked {
 				if len(msg.ID) > 0 {
@@ -375,6 +392,8 @@ func (b *bridge) handleToolsCall(msg rpc) {
 	switch p.Name {
 	case toolAskAmp:
 		b.handleAskAmp(msg.ID, p.Arguments)
+	case toolSendAmp:
+		b.handleSendAmp(msg.ID, p.Arguments)
 	case toolReply:
 		b.handleReply(msg.ID, p.Arguments)
 	default:
@@ -433,6 +452,132 @@ func (b *bridge) handleAskAmp(id, args json.RawMessage) {
 	b.reply(id, toolResult(out, false))
 }
 
+func (b *bridge) handleSendAmp(id, args json.RawMessage) {
+	var a struct {
+		Text     string `json:"text"`
+		ThreadID string `json:"thread_id"`
+	}
+	if err := decodeArgs(args, &a); err != nil {
+		b.fail(id, errInvalidParams, "invalid send_amp arguments: "+err.Error())
+		return
+	}
+	if b.cfg.ampDisabled {
+		b.reply(id, toolResult(errOutboundDisabled.Error(), true))
+		return
+	}
+	if strings.TrimSpace(a.Text) == "" {
+		b.reply(id, toolResult(errEmptyText.Error(), true))
+		return
+	}
+	if strings.TrimSpace(a.ThreadID) == "" {
+		b.reply(id, toolResult("thread_id is required for send_amp", true))
+		return
+	}
+	if !threadIDRE.MatchString(a.ThreadID) {
+		b.reply(id, toolResult(fmt.Sprintf("implausible Amp thread id %q", a.ThreadID), true))
+		return
+	}
+	if b.shuttingDown() {
+		b.reply(id, toolResult("bridge is shutting down; the request was not started", true))
+		return
+	}
+
+	select {
+	case b.asyncSlots <- struct{}{}:
+		// Slot acquired.
+	default:
+		b.reply(id, toolResult(fmt.Sprintf(
+			"too many send_amp requests in flight (%d/%d); wait for a completion event",
+			cap(b.asyncSlots), cap(b.asyncSlots),
+		), true))
+		return
+	}
+
+	suffix, err := newRequestID()
+	if err != nil {
+		<-b.asyncSlots
+		b.reply(id, toolResult(err.Error(), true))
+		return
+	}
+	asyncID := "amp-async-" + suffix
+	ack := toolResult(
+		"started async Amp request "+asyncID+" for "+a.ThreadID+". End this turn; "+
+			"the result will arrive as a channel completion event. No reply is required. "+
+			"Restarting this MCP server before completion loses that event.", false,
+	)
+	if err := b.send(rpc{ID: id, Result: ack}); err != nil {
+		<-b.asyncSlots
+		b.logf("SEND_AMP_ACK_FAILED async_id=%s thread=%s — request not started", asyncID, a.ThreadID)
+		return
+	}
+	b.logf("SEND_AMP_STARTED async_id=%s thread=%s bytes=%d", asyncID, a.ThreadID, len(a.Text))
+
+	// The enclosing tools/call goroutine is already in toolWG, so registering
+	// the background job here happens before that count can return to zero and
+	// race shutdown's Wait.
+	b.toolWG.Go(func() {
+		defer func() { <-b.asyncSlots }()
+		if panicked := b.guard("send_amp "+asyncID, func() {
+			out, askErr := b.askAmpExplicit(a.ThreadID, a.Text)
+			b.pushAsyncCompletion(asyncID, a.ThreadID, out, askErr)
+		}); panicked {
+			b.logf("SEND_AMP_PANICKED async_id=%s thread=%s — completion not delivered", asyncID, a.ThreadID)
+		}
+	})
+}
+
+func (b *bridge) pushAsyncCompletion(asyncID, threadID, out string, askErr error) {
+	status := "done"
+	content := "Async Amp request " + asyncID + " completed for thread " + threadID +
+		". Amp replied:\n\n" + out
+	if askErr != nil {
+		status = "error"
+		content = "Async Amp request " + asyncID + " failed for thread " + threadID +
+			":\n\n" + askErr.Error()
+	}
+	content += "\n\nNo reply is required; this is a send_amp completion event."
+	normalized := strings.ToValidUTF8(content, "�")
+	if originalBytes := len(normalized); originalBytes > b.cfg.maxMessageBytes {
+		content = truncateMessage(normalized, b.cfg.maxMessageBytes)
+		b.logf("SEND_AMP_COMPLETION_TRUNCATED async_id=%s bytes=%d max=%d",
+			asyncID, originalBytes, b.cfg.maxMessageBytes)
+	} else {
+		content = normalized
+	}
+	meta := map[string]string{
+		"async_id":  asyncID,
+		"thread_id": threadID,
+		"status":    status,
+	}
+	if err := b.pushChannelNotification(content, meta); err != nil {
+		b.logf("SEND_AMP_COMPLETION_FAILED async_id=%s status=%s %v", asyncID, status, err)
+		return
+	}
+	b.logf("SEND_AMP_COMPLETED async_id=%s status=%s bytes=%d", asyncID, status, len(out))
+}
+
+// truncateMessage applies the user-facing message cap without producing invalid
+// UTF-8. The marker is ASCII so even a very small operator override remains
+// valid; metadata still carries the async id and completion status.
+func truncateMessage(s string, maxBytes int) string {
+	// Tool/subprocess output is not guaranteed to be valid text. Normalize it
+	// once before choosing a byte boundary; repeatedly validating a prefix that
+	// contains one bad byte would otherwise discard everything and take O(n²).
+	s = strings.ToValidUTF8(s, "�")
+	if len(s) <= maxBytes {
+		return s
+	}
+	const marker = " [truncated]"
+	if maxBytes <= len(marker) {
+		return marker[:maxBytes]
+	}
+	cut := maxBytes - len(marker)
+	for cut > 0 && !utf8.ValidString(s[:cut]) {
+		cut--
+	}
+	return s[:cut] + marker
+}
+
 // decodeArgs tolerates a missing or null arguments member, which some clients
 // omit entirely for a no-argument call.
 func decodeArgs(args json.RawMessage, into any) error {
@@ -466,9 +611,10 @@ var replyTool = map[string]any{
 var askAmpTool = map[string]any{
 	"name": toolAskAmp,
 	"description": "Send a message to the Amp thread on the other side of this bridge and wait " +
-		"for its answer. Use this to ASK Amp something or hand it work — it is the only way " +
-		"to start a conversation with Amp, since the reply tool can only answer an event Amp " +
-		"already sent. Blocks until Amp finishes its turn.",
+		"for its answer. Use this for a consultation whose result you need before continuing; " +
+		"use send_amp for independent background work. The reply tool can only answer an event " +
+		"Amp already sent. Blocks until Amp finishes its turn. An inbox can append into an open " +
+		"Amp thread but cannot wake it while idle; a no-turn error means the message is already there.",
 	"inputSchema": map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -483,6 +629,31 @@ var askAmpTool = map[string]any{
 			},
 		},
 		"required": []string{"text"},
+	},
+}
+
+var sendAmpTool = map[string]any{
+	"name": toolSendAmp,
+	"description": "Start work in an Amp thread without blocking this Claude turn. Requires an " +
+		"explicit thread_id and returns an async handle immediately. End the current turn; " +
+		"success or failure arrives later as a channel event with async_id and requires no reply. " +
+		"The CLI fallback starts an unheld thread, but an inbox only appends into an open thread " +
+		"and cannot wake it while idle. Use ask_amp instead when you need Amp's answer before " +
+		"continuing. Outstanding " +
+		"completions are in memory and are lost if this MCP server restarts.",
+	"inputSchema": map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"text": map[string]any{
+				"type":        "string",
+				"description": "Self-contained work or question for the Amp thread.",
+			},
+			"thread_id": map[string]any{
+				"type":        "string",
+				"description": "Explicit Amp thread id. Required so concurrent work cannot be misrouted.",
+			},
+		},
+		"required": []string{"text", "thread_id"},
 	},
 }
 

@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // The protocol contract. Each of these guards a mistake that cost real debugging
@@ -129,12 +131,12 @@ func TestToolsList(t *testing.T) {
 	}
 
 	// Both directions must be exposed or the bridge is only half-duplex.
-	for _, want := range []string{toolReply, toolAskAmp} {
+	for _, want := range []string{toolReply, toolAskAmp, toolSendAmp} {
 		if _, ok := byName[want]; !ok {
 			t.Errorf("tool %q not exposed; have %v", want, keys(byName))
 		}
 	}
-	if len(byName) != 2 {
+	if len(byName) != 3 {
 		t.Errorf("unexpected tools exposed: %v", keys(byName))
 	}
 
@@ -144,6 +146,9 @@ func TestToolsList(t *testing.T) {
 	}
 	if r := requiredFields(t, byName[toolAskAmp]); !r["text"] {
 		t.Errorf("ask_amp must require text, got %v", r)
+	}
+	if r := requiredFields(t, byName[toolSendAmp]); !r["text"] || !r["thread_id"] {
+		t.Errorf("send_amp must require text and thread_id, got %v", r)
 	}
 }
 
@@ -269,6 +274,58 @@ func TestAskAmpWithoutThreadExplainsItself(t *testing.T) {
 	res := result(t, h.response(t, "aa"))
 	if !isToolError(t, res) || !strings.Contains(toolText(t, res), "thread_id") {
 		t.Errorf("with no known thread, ask_amp should explain how to supply one: %v", res)
+	}
+}
+
+func TestSendAmpRequiresAnExplicitThread(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(c *config) { c.ampDisabled = false })
+
+	h.call(t, map[string]any{
+		"jsonrpc": "2.0", "id": "sa", "method": "tools/call",
+		"params": map[string]any{
+			"name":      toolSendAmp,
+			"arguments": map[string]any{"text": "background work"},
+		},
+	})
+
+	res := result(t, h.response(t, "sa"))
+	if !isToolError(t, res) || !strings.Contains(toolText(t, res), "thread_id is required") {
+		t.Errorf("send_amp must refuse implicit routing: %v", res)
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("transport closed") }
+
+func TestSendAmpDoesNotStartWhenTheHandleCannotBeDelivered(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig()
+	cfg.ampDisabled = false
+	var log syncBuf
+	b := newBridge(cfg, failingWriter{}, &log)
+
+	b.handleSendAmp(json.RawMessage(`"ack"`), mustJSON(map[string]any{
+		"text": "do not run invisibly", "thread_id": "T-ack-failure",
+	}))
+
+	if got := len(b.asyncSlots); got != 0 {
+		t.Errorf("failed acknowledgement leaked %d async slot(s)", got)
+	}
+	if !strings.Contains(log.String(), "SEND_AMP_ACK_FAILED") || strings.Contains(log.String(), "SEND_AMP_STARTED") {
+		t.Errorf("log should say the request was not started: %s", log.String())
+	}
+}
+
+func TestTruncateMessagePreservesUTF8AndTheByteCap(t *testing.T) {
+	t.Parallel()
+	got := truncateMessage("useful\xff"+strings.Repeat("é", 20), 25)
+	if len(got) > 25 || !utf8.ValidString(got) || !strings.Contains(got, "[truncated]") {
+		t.Errorf("truncateMessage = %q (%d bytes)", got, len(got))
+	}
+	if !strings.Contains(got, "useful") {
+		t.Errorf("an invalid byte discarded valid output: %q", got)
 	}
 }
 

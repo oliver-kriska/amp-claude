@@ -208,7 +208,8 @@ func trustedRuntimeDir() (string, error) {
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
 		return "", fmt.Errorf(
 			"runtime dir %s is mode %04o — group/other access must be off (chmod 700 %s)",
-			dir, perm, dir)
+			dir, perm, dir,
+		)
 	}
 	return dir, nil
 }
@@ -233,7 +234,8 @@ func ownRuntimeDir() (string, error) {
 		if uid := os.Getuid(); int(st.Uid) != uid {
 			return "", fmt.Errorf(
 				"runtime dir %s is owned by uid %d, not %d — refusing to use it",
-				dir, st.Uid, uid)
+				dir, st.Uid, uid,
+			)
 		}
 	}
 	return dir, nil
@@ -283,7 +285,8 @@ func bindSocket(sock string) (net.Listener, error) {
 		if socketIsLive(sock) {
 			return nil, fmt.Errorf(
 				"another amp-bridge is already listening on %s — "+
-					"refusing to hijack it (set AMP_BRIDGE_SOCKET to use a different path)", sock)
+					"refusing to hijack it (set AMP_BRIDGE_SOCKET to use a different path)", sock,
+			)
 		}
 		_ = os.Remove(sock) // stale
 	}

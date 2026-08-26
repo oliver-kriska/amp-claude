@@ -11,8 +11,8 @@ import (
 // makes the wire behaviour reproducible under test: a test builds the config it
 // wants instead of mutating process-global state.
 type config struct {
-	// maxInFlight caps unanswered channel events. Without it a runaway loop on
-	// the Amp side floods the Claude session.
+	// maxInFlight separately caps unanswered channel events and background Amp
+	// turns. Without it a runaway loop on either side floods the other session.
 	maxInFlight int
 	// maxMessageBytes caps a single message. Without it one large payload eats
 	// the session's context window.
@@ -23,7 +23,7 @@ type config struct {
 	// bodies carry conversation content.
 	logBodies bool
 
-	// ampBin is the Amp CLI invoked by the ask_amp tool.
+	// ampBin is the Amp CLI used by the Claude->Amp tools when no inbox is live.
 	ampBin string
 	// ampTimeout bounds a single `amp threads continue` turn.
 	ampTimeout time.Duration
@@ -38,7 +38,7 @@ func loadConfig() config {
 		replyWait:       envDuration("AMP_BRIDGE_TIMEOUT", 180*time.Second),
 		logBodies:       os.Getenv("AMP_BRIDGE_LOG_BODIES") == "1",
 		ampBin:          envStr("AMP_BIN", "amp"),
-		ampTimeout:      envDuration("AMP_BRIDGE_AMP_TIMEOUT", 300*time.Second),
+		ampTimeout:      envDuration("AMP_BRIDGE_AMP_TIMEOUT", 120*time.Second),
 		ampDisabled:     os.Getenv("AMP_BRIDGE_DISABLE_OUTBOUND") == "1",
 	}
 }

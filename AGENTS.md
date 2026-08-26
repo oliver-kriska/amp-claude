@@ -16,8 +16,11 @@ Amp ──unix socket──▶ amp-bridge ──notifications/claude/channel─�
 Amp ◀──unix socket── amp-bridge ◀────── reply tool ────────────── Claude session
 ```
 
-Claude can also start conversations, via an `ask_amp` tool that shells out to
-`amp threads continue <id> --execute`.
+Claude can also initiate requests. `ask_amp` waits for an Amp turn; `send_amp`
+returns a handle immediately and pushes the result back as a later channel event.
+Both use the live inbox plugin when available and otherwise shell out to
+`amp threads continue <id> --execute`. The CLI fallback starts an unheld thread;
+the plugin can append into an open thread but cannot wake it while idle.
 
 ## Using it
 
@@ -36,11 +39,12 @@ first** — it names the live sessions and confirms the channel is loaded. If
 exactly one session is live, `--session` is optional.
 
 Pass `--thread` with your own Amp thread id when you want Claude to be able to
-call `ask_amp` back into *this* thread. The id rides along on the event Claude
+call an outbound tool back into *this* thread. The id rides along on the event Claude
 receives (as a `thread_id` attribute on the `<channel>` tag), so Claude can
 address the right thread even when several are talking to one session. Without
-it the bridge falls back to whichever thread messaged it last — fine for a single
-thread, wrong as soon as there are two.
+it `ask_amp` falls back to whichever thread messaged it last — fine for a single
+thread, wrong as soon as there are two. `send_amp` always requires an explicit id
+and never changes that remembered pair.
 
 ## Timing
 
@@ -54,17 +58,28 @@ do not arrive in launch order** — `&`-launched jobs race to the socket. Never
 assert "the first job got the first answer"; each response carries its own
 `request_id`, and that is the only correct way to pair question with answer.
 
+For Claude→Amp concurrency, use `send_amp(text=…, thread_id=…)`. It returns an
+`amp-async-…` handle; Claude must end that turn, then receives success or failure
+as a `<channel async_id="…" status="…">` completion event. No `reply` call is
+needed for a completion. Outstanding completions are in memory and are lost if
+the MCP server restarts. Against an open idle thread, expect a `no-turn` error:
+the inbox appended the request, but Amp exposes no plugin wake primitive.
+
 ## Limits, and what they mean
 
 | Limit | Default | Behaviour when exceeded |
 |---|---|---|
 | In-flight requests | 8 | `too many requests in flight` — Claude hasn't answered earlier ones |
+| Async Amp turns | 8 | `too many send_amp requests in flight` — wait for a completion |
 | Message size | 64 KB | `message too large` — send a summary or a file path instead |
 | Reply timeout | 180 s | `timed out waiting for Claude` |
+| Amp turn timeout | 120 s | `ask_amp` fails or `send_amp` reports an error completion |
 
 All are env-tunable (`AMP_BRIDGE_MAX_INFLIGHT`, `AMP_BRIDGE_MAX_BYTES`,
-`AMP_BRIDGE_TIMEOUT`) but the defaults exist to stop a runaway loop from flooding
-someone's session. Raise them deliberately, not reflexively.
+`AMP_BRIDGE_TIMEOUT`, `AMP_BRIDGE_AMP_TIMEOUT`) but the defaults exist to stop a
+runaway loop from flooding someone's session. Raise them deliberately, not
+reflexively; `doctor` warns if the Amp timeout leaves 30 s or less before the
+Claude reply deadline.
 
 ## Failure triage
 
@@ -80,6 +95,7 @@ at a stale build, where everything reports healthy and nothing is delivered.
 | exit 2, `cannot reach <name> at <path>` | Registry entry exists but the socket is dead; the bridge process died. |
 | exit 1, `timed out waiting for Claude` | Socket fine, event delivered, but Claude never called `reply`. The interesting failure — report it rather than retrying blindly. |
 | exit 1, `timed out waiting for Claude` *after* Claude appeared to answer | Claude replied without a `request_id` while several requests were in flight. The bridge refuses to guess and tells Claude so; if Claude does not retry with the id, your call just times out. You never see the guard message itself — it goes to Claude, not to you. |
+| `another CLI fallback turn … is already in flight` | The same idle thread is already running a bridge-started turn. Wait, or enable its inbox when turns need to queue. |
 | exit 137 | The binary was replaced with `cp`, invalidating its macOS code signature. Rebuild, don't work around it. |
 
 Server-side view: `~/.local/state/amp-bridge/amp-bridge.log` — look for `EVENT_PUSHED`,
@@ -98,14 +114,27 @@ routing around a denial defeats the point of it.
 Keep messages self-contained. Claude sees the text and nothing else — not your
 thread history, not your files, not your tool output.
 
-`ask_amp` can reach a thread you have open **only if that thread's inbox is
-enabled**. Amp permits one executor per thread and your interactive session holds
-it, so `threads continue --execute` cannot attach a second; the inbox plugin gets
-around that by appending through the executor your own session already holds.
+`ask_amp` and `send_amp` can reach a thread you have open **only if that thread's
+inbox is enabled**. Amp permits one executor per thread and your interactive
+session holds it, so `threads continue --execute` cannot attach a second; the
+inbox plugin gets around that by appending through the executor your own session
+already holds. Appending does not start an idle turn. The user must start the
+next activity; never resend after `no-turn`, because the request is already there
+and that later activity may pick it up.
 Install it with `amp-bridge init --amp-plugin --global`, reload plugins, then
 `Ctrl+O` → `amp-bridge: Enable Claude inbox for this thread`. It is off by default
-on every thread, and only you can turn it on — there is no way to enable it from
-outside the session.
+on every new thread, and only the user can turn it on. For a managed/background
+thread with no palette of its own, use `Ctrl+O` → `amp-bridge: Enable Claude inbox
+for another thread` from a local Amp thread and paste the target URL/id. That
+local thread becomes the explicit controller; unrelated hosts cannot claim the
+consent. Once enabled, the target stays opted in across plugin reloads and returns
+after local Amp process restarts when the controller thread reopens, until the
+matching Disable command revokes it. Reopening the managed target alone does not
+transfer ownership. Named enablement always makes the target addressable and
+delivers automatically while it is running. An idle target cannot be awakened by
+the current Amp plugin API; its request stays queued and the controller is
+notified to continue it. If the controller is deleted, the Disable command from
+another local thread can explicitly revoke the pairing after confirmation.
 
 Without an inbox, the inbound direction is the only one that works for a thread
 you are sitting in — you call `amp-bridge --ask`, Claude answers with `reply`.
@@ -118,6 +147,11 @@ turn ends, so it cannot answer an inbound event; your `--ask` would block until
 it timed out at 180 s. Just answer in your turn output — that is what Claude
 receives. `amp-bridge --list` is fine either way, since it only reads the
 registry.
+
+The Claude-turn deadlock does not apply to `send_amp`: it returns before Amp
+runs. Its message must be self-contained, because there is no synchronous
+follow-up or polling tool; the result arrives as a later event. This does not
+solve Amp-side wake-up for an open idle thread.
 
 ## Building and testing
 

@@ -15,6 +15,8 @@ func TestParseArgs(t *testing.T) {
 	}{
 		{"no arguments means serve", nil, options{mode: modeServe, dir: "."}},
 		{"list", []string{"--list"}, options{mode: modeList, dir: "."}},
+		{"verbose list", []string{"--list", "--verbose"}, options{mode: modeList, dir: ".", verbose: true}},
+		{"verbose before list", []string{"--verbose", "--list"}, options{mode: modeList, dir: ".", verbose: true}},
 		{"help", []string{"--help"}, options{mode: modeHelp, dir: "."}},
 		{"version", []string{"--version"}, options{mode: modeVersion, dir: "."}},
 		{"ask", []string{"--ask", "hello"}, options{mode: modeAsk, text: "hello", dir: "."}},
@@ -25,8 +27,14 @@ func TestParseArgs(t *testing.T) {
 		},
 		{
 			"session and thread",
-			[]string{"--session", "b1", "--thread", "T-7", "--ask", "hi"},
-			options{mode: modeAsk, session: "b1", thread: "T-7", text: "hi", dir: "."},
+			[]string{"--session", "b1", "--thread", "T-01a01877-2274-734d-8306-7c37b33f2a7f", "--ask", "hi"},
+			options{
+				mode:    modeAsk,
+				session: "b1",
+				thread:  "T-01a01877-2274-734d-8306-7c37b33f2a7f",
+				text:    "hi",
+				dir:     ".",
+			},
 		},
 		{
 			"flags after --ask belong to the message",
@@ -63,6 +71,8 @@ func TestParseArgsErrors(t *testing.T) {
 		{"thread without a value", []string{"--thread"}, "needs a value"},
 		{"ask without a message", []string{"--ask"}, "needs a message"},
 		{"ask with only spaces", []string{"--ask", "   "}, "needs a message"},
+		{"verbose without list", []string{"--verbose"}, "only valid with --list"},
+		{"verbose ask", []string{"--verbose", "--ask", "hello"}, "only valid with --list"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -149,7 +159,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 		replyWait:       180 * time.Second,
 		logBodies:       false,
 		ampBin:          "amp",
-		ampTimeout:      300 * time.Second,
+		ampTimeout:      120 * time.Second,
 		ampDisabled:     false,
 	}
 	if got != want {

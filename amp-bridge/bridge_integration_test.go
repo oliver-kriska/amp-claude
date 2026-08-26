@@ -356,8 +356,8 @@ func TestProcessHandshakeAndTools(t *testing.T) {
 		n, _ := m["name"].(string)
 		names[n] = true
 	}
-	if !names[toolReply] || !names[toolAskAmp] {
-		t.Errorf("both directions must be exposed, got %v", names)
+	if !names[toolReply] || !names[toolAskAmp] || !names[toolSendAmp] {
+		t.Errorf("reply plus synchronous and asynchronous outbound tools must be exposed, got %v", names)
 	}
 }
 
@@ -583,6 +583,17 @@ func TestProcessClientListAndAsk(t *testing.T) {
 	}
 	if !strings.Contains(string(listOut), "claude_pid=") {
 		t.Errorf("--list should name the live bridge, got %q", listOut)
+	}
+	verboseCmd := exec.Command(p.bin, "--list", "--verbose")
+	verboseCmd.Env = p.env
+	verboseOut, err := verboseCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--list --verbose failed: %v: %s", err, verboseOut)
+	}
+	for _, want := range []string{"bridge_pid=", "version=", "build=", "handshake=", "socket="} {
+		if !strings.Contains(string(verboseOut), want) {
+			t.Errorf("verbose list omitted %q: %s", want, verboseOut)
+		}
 	}
 
 	// --ask blocks until Claude replies, so answer it from this side.

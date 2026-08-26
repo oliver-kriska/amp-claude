@@ -126,3 +126,88 @@ Amp — the thread used for consultation was unreachable while this was fixed. I
 may be intended (an append is not a send), or it may be a bug on that side. The
 watchdog is correct either way: it converts an unbounded silence into a fast,
 specific error, which is the part the caller needed regardless of the answer.
+
+---
+
+## Second reproduction, 2026-08-25 — and a much cleaner one
+
+A live test of the new `send_amp` tool reproduced the no-turn condition exactly,
+this time with a trivial isolated case rather than a real workload.
+
+Amp asked (over the channel) for a `send_amp` to its own thread carrying a
+one-line message: *"reply with exactly ACK LIVE-… and nothing else."* The
+completion event came back `status="error"` with thread state **idle** — message
+appended, no turn started.
+
+**The test design guarantees the failure, and that is the finding.** Amp ended
+its turn to wait for Claude's reply, so by the time `send_amp` delivered, that
+thread was idle *by construction*. There was nothing in flight to steer past.
+
+### What this confirms
+
+- The async completion path works end to end: unsolicited event, `async_id` /
+  `status` / `thread_id` as attributes, no `request_id`, "no reply is required".
+- The corrected no-turn wording ships correctly — semicolon, "ask your user to
+  open that thread and reply there", then the Go layer's "do not resend the same
+  question, it is already there". No contradiction in the assembled string.
+- The watchdog fires fast on an idle thread instead of burning the budget.
+
+### The structural problem it exposes
+
+`steer: true` helps only when something is already running. On an **idle**
+thread it has nothing to prefer the message ahead of, so the message just sits
+there.
+
+That matters far more for `send_amp` than for `ask_amp`, because of when each is
+used. An Amp thread is idle precisely when it is waiting on Claude — which is
+exactly when Claude would reach for `send_amp` to hand back background work. So
+the tool's main use case lands on the one thread state where delivery does not
+wake anything.
+
+**`send_amp` to an idle thread is fire-and-delivered-eventually.** Not a bridge
+defect: the append succeeds, the watchdog reports honestly, and the error tells
+the user what to do. But the feature's practical value depends on an Amp-side
+wake mechanism that does not currently exist.
+
+> **Corrected 2026-08-25 (same day), by Amp's trace.** I first wrote
+> "fire-and-never-delivered". That is wrong. Amp traced the live test:
+> `APPEND_OK` → `NO_TURN state=idle` at 20s → and **the ACK appeared once later
+> user activity caused Amp to process the already-appended message**. The
+> message is not lost, it is *latent* — queued indefinitely with no scheduled
+> wake. Any activity on the thread drains it; a reply is not special.
+>
+> This creates a hazard of its own: the plugin gives up at `NO_TURN`, reports
+> `error`, and releases the lane, but the message stays queued and *is* answered
+> later. **The caller is told the request failed while the work still happens** —
+> the ambiguous-delivery class arriving by a new route. "It is sitting in the
+> thread unanswered" is true when written but reads as terminal; it should say
+> the message will be picked up the next time that thread does anything.
+
+**Amp's API confirmation (2026-08-25):** the published `PluginThread` surface is
+`agent()`, `parentThreadID()`, `title`, `state`, `waitForResponse()`, `cancel()`,
+`setVisibility()` and message reads — a cancel with no corresponding start. There
+is **no wake/start/execute operation for an existing thread**.
+
+The only alternative visible in the API: `agent()` is documented as "suitable for
+creating related threads", so a plugin could spawn a **child** thread rather than
+append to the idle one. That buys a wake at the cost of answering in a different
+thread from the one the user is sitting in — which defeats the point of the
+inbox, whose whole value is reaching an open thread. Worth knowing it exists; not
+worth building.
+
+**Scope the blockage precisely.** Not both tools equally:
+- `send_amp` is genuinely blocked — its premise is handing work to a thread that
+  is idle *because* it is waiting on Claude.
+- `ask_amp` is degraded but honest — the caller is blocked and the user is
+  present, so failing fast with actionable advice is defensible.
+
+This is the same question raised about AgentChute in
+[[an-append-is-not-a-send]] — *they had a wake adapter and removed it; what
+replaced it?* Amp's `appendUserMessage` has the identical gap, and this test is
+the cleanest available demonstration of it.
+
+### Better bug report material than the original
+
+The August 21 case needed log forensics across a real workload. This one is a
+two-line repro: arm an inbox on an idle thread, append anything, observe that no
+turn starts. Worth sending to Amp upstream in this form.

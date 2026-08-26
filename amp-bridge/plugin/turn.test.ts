@@ -12,6 +12,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 
 const THREAD = 'T-01a02275-c11d-7585-9b65-bdc0e4c58162'
+const MANAGED = 'T-01a0335c-7794-769d-b5b4-f8a8b8bb2347'
 const LOAD_GUARD = '__ampBridgeInboxLoaded'
 
 let dir: string
@@ -21,9 +22,11 @@ type Ev = (e: unknown) => unknown
 
 interface Harness {
   enable: () => Promise<void>
+  enableManaged: () => Promise<void>
   dispose: () => Promise<void>
   appendCalls: Array<{ content: string; options: unknown }>
   fire: (name: string, event: unknown) => void
+  notices: string[]
   setState: (s: unknown) => void
 }
 
@@ -32,6 +35,7 @@ async function loadPlugin(): Promise<Harness> {
   const disposers: Array<() => Promise<void> | void> = []
   const handlers = new Map<string, Ev[]>()
   const appendCalls: Array<{ content: string; options: unknown }> = []
+  const notices: string[] = []
   let threadState: unknown = 'idle'
 
   const amp = {
@@ -55,6 +59,7 @@ async function loadPlugin(): Promise<Harness> {
     },
     activeThread: { current: { id: THREAD }, subscribe: () => {} },
     system: { executor: { kind: 'local' } },
+    ui: { notify: async (message: string) => void notices.push(message) },
   }
 
   const mod = await import(`./amp-bridge-inbox.ts?turn=${++load}`)
@@ -62,6 +67,7 @@ async function loadPlugin(): Promise<Harness> {
 
   return {
     appendCalls,
+    notices,
     setState: (s: unknown) => {
       threadState = s
     },
@@ -73,6 +79,18 @@ async function loadPlugin(): Promise<Harness> {
       if (!h) throw new Error('enable command not registered')
       await h({ thread: { id: THREAD }, ui: { notify: async () => {} } })
     },
+    enableManaged: async () => {
+      const h = commands.get('Enable Claude inbox for another thread')
+      if (!h) throw new Error('managed enable command not registered')
+      await h({
+        thread: { id: THREAD },
+        ui: {
+          notify: async () => {},
+          input: async () => MANAGED,
+          confirm: async () => true,
+        },
+      })
+    },
     dispose: async () => {
       for (const d of disposers) await d()
     },
@@ -83,7 +101,7 @@ const sockPath = () => path.join(dir, 'inbox', `plugin-${process.pid}.sock`)
 
 // Speaks the same wire protocol ask_amp does, so what the test observes is what
 // the Go client would observe.
-function ask(timeoutMs: number): Promise<Record<string, unknown>> {
+function ask(timeoutMs: number, threadID = THREAD): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const c = net.createConnection(sockPath())
     let buf = ''
@@ -93,7 +111,7 @@ function ask(timeoutMs: number): Promise<Record<string, unknown>> {
         JSON.stringify({
           op: 'ask',
           id: 'abcdef012345',
-          thread_id: THREAD,
+          thread_id: threadID,
           text: 'is the build green?',
           from: 'test-session',
           timeout_ms: timeoutMs,
@@ -155,8 +173,21 @@ test('the message is reported as already delivered, not lost', async () => {
   p.setState('idle')
   const reply = await ask(2000)
   // Resending would duplicate the question, so the caller must be told it landed.
-  expect(String(reply.error)).toContain('sitting in the thread unanswered')
+  expect(String(reply.error)).toContain('queued in the thread but unanswered for now')
+  expect(String(reply.error)).toContain('next activity in that thread may pick it up')
   expect(String(reply.error)).not.toMatch(/send it again|resend it/i)
+  await p.dispose()
+})
+
+test('an idle managed thread notifies its controller that the request is queued', async () => {
+  const p = await loadPlugin()
+  await p.enableManaged()
+  p.setState('idle')
+
+  const reply = await ask(2000, MANAGED)
+  expect(reply.code).toBe('no-turn')
+  expect(p.notices).toContainEqual(expect.stringContaining(`managed thread ${MANAGED}`))
+  expect(p.notices).toContainEqual(expect.stringContaining('do not ask Claude to resend'))
   await p.dispose()
 })
 
@@ -235,6 +266,38 @@ test('a turn that does start disarms the watchdog and answers normally', async (
 
   const reply = await pending
   expect(reply.reply).toBe('yes, green')
+  expect(reply.code).toBeUndefined()
+  await p.dispose()
+})
+
+test('a request steered into an existing turn is correlated at agent end', async () => {
+  const p = await loadPlugin()
+  await p.enable()
+  p.setState('running')
+
+  // The turn predates the bridge request, so its agent.start cannot contain a
+  // marker that does not exist yet.
+  p.fire('agent.start', { thread: { id: THREAD }, message: 'run a long tool', id: 'M-existing' })
+  const pending = ask(4000)
+  await Bun.sleep(120)
+
+  const marker = /\[(amp-bridge-req-[0-9a-f]{12})\]/.exec(p.appendCalls[0].content)
+  expect(marker).not.toBeNull()
+  p.fire('agent.end', {
+    thread: { id: THREAD },
+    id: 'M-existing',
+    status: 'done',
+    message: 'run a long tool',
+    messages: [
+      { role: 'user', id: 'U-original', content: [{ type: 'text', text: 'run a long tool' }] },
+      { role: 'assistant', id: 'A-before', content: [{ type: 'text', text: 'starting the tool' }] },
+      { role: 'user', id: 'U-steer', content: [{ type: 'text', text: p.appendCalls[0].content }] },
+      { role: 'assistant', id: 'A-after', content: [{ type: 'text', text: 'steered answer' }] },
+    ],
+  })
+
+  const reply = await pending
+  expect(reply.reply).toBe('steered answer')
   expect(reply.code).toBeUndefined()
   await p.dispose()
 })

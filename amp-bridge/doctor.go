@@ -53,6 +53,8 @@ type check struct {
 	fix    string
 }
 
+const timeoutRecoveryMargin = 30 * time.Second
+
 func cmdDoctor(cfg config, dir string, strict bool) int {
 	checks := []check{
 		checkBinary(),
@@ -62,6 +64,7 @@ func cmdDoctor(cfg config, dir string, strict bool) int {
 		checkPluginInboxes(),
 		checkInstalledPlugin(dir),
 		checkAmpCLI(cfg),
+		checkTimeoutOrdering(cfg),
 		checkLog(),
 	}
 
@@ -94,6 +97,40 @@ func cmdDoctor(cfg config, dir string, strict bool) int {
 		return 1
 	}
 	return 0
+}
+
+// checkTimeoutOrdering keeps a nested Claude->Amp consultation inside the
+// Amp->Claude caller's deadline with enough time left for Claude to deliver its
+// final reply. The bridge cannot enforce this per call because ask_amp exposes
+// no public timeout argument, so doctor makes a bad environment override loud.
+func checkTimeoutOrdering(cfg config) check {
+	const name = "timeout ordering"
+	if cfg.ampDisabled {
+		return check{name, statusOK, "outbound disabled", ""}
+	}
+	// The plugin's hard socket deadline intentionally sits beyond its own Amp
+	// turn budget so a richer plugin diagnosis wins the race. Doctor must use
+	// that outer bound, not the optimistic inner budget, at this safety margin.
+	outboundBound := cfg.ampTimeout + inboxTimeoutLead
+	remaining := cfg.replyWait - outboundBound
+	if remaining <= timeoutRecoveryMargin {
+		detail := fmt.Sprintf("ask_amp worst-case %s leaves %s before the %s Claude reply deadline (need >%s)",
+			outboundBound, remaining, cfg.replyWait, timeoutRecoveryMargin)
+		if remaining <= 0 {
+			detail = fmt.Sprintf("ask_amp worst-case %s can outlive the %s Claude reply deadline",
+				outboundBound, cfg.replyWait)
+		}
+		return check{
+			name, statusWarn,
+			detail,
+			"lower AMP_BRIDGE_AMP_TIMEOUT or raise AMP_BRIDGE_TIMEOUT so more than 30s remains",
+		}
+	}
+	return check{
+		name, statusOK,
+		fmt.Sprintf("ask_amp worst-case %s leaves %s before the %s Claude reply deadline",
+			outboundBound, remaining, cfg.replyWait), "",
+	}
 }
 
 // checkBinary catches the drift that bites hardest: several copies of the

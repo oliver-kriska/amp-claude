@@ -284,6 +284,57 @@ func TestDoctorStrictPromotesWarnings(t *testing.T) {
 	}
 }
 
+func TestDoctorChecksTimeoutOrdering(t *testing.T) {
+	t.Parallel()
+
+	healthy := testConfig()
+	healthy.ampDisabled = false
+	healthy.replyWait = 3 * time.Minute
+	healthy.ampTimeout = 2 * time.Minute
+	if got := checkTimeoutOrdering(healthy); got.status != statusOK {
+		t.Errorf("default ordering should be healthy, got %s: %s", got.status.symbol(), got.detail)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		ampTimeout time.Duration
+		want       string
+	}{
+		{"exactly the recovery margin", 140 * time.Second, "need >30s"},
+		{"Amp can outlive Claude", 4 * time.Minute, "outlive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := healthy
+			cfg.ampTimeout = tc.ampTimeout
+			got := checkTimeoutOrdering(cfg)
+			if got.status != statusWarn {
+				t.Fatalf("status = %s, want warn: %s", got.status.symbol(), got.detail)
+			}
+			if !strings.Contains(got.detail, tc.want) || !strings.Contains(got.fix, "AMP_BRIDGE_AMP_TIMEOUT") {
+				t.Errorf("warning is not actionable: %q / %q", got.detail, got.fix)
+			}
+		})
+	}
+
+	disabled := healthy
+	disabled.ampDisabled = true
+	disabled.ampTimeout = 10 * time.Minute
+	if got := checkTimeoutOrdering(disabled); got.status != statusOK {
+		t.Errorf("outbound-disabled bridge should not warn, got %s", got.status.symbol())
+	}
+}
+
+func TestMCPServerAlreadyExists(t *testing.T) {
+	t.Parallel()
+	if !mcpServerAlreadyExists([]byte("MCP server amp-bridge already exists in user config")) {
+		t.Error("Claude's duplicate-registration diagnostic should allow skill refresh")
+	}
+	if mcpServerAlreadyExists([]byte("permission denied")) {
+		t.Error("an unrelated registration failure must remain fatal")
+	}
+}
+
 func TestTrustedRuntimeDirRefusesAWorldWritableDir(t *testing.T) {
 	dir := shortTempDir(t)
 	if err := os.Chmod(dir, 0o777); err != nil {
@@ -584,5 +635,8 @@ func TestEmbeddedSkillIsPresent(t *testing.T) {
 	}
 	if !strings.Contains(skillDoc, "request_id") {
 		t.Error("embedded skill does not look like the amp-bridge skill")
+	}
+	if !strings.Contains(skillDoc, "Do not omit `--thread`") {
+		t.Error("embedded skill does not teach Amp to identify its source thread")
 	}
 }

@@ -122,6 +122,11 @@ func cmdInitAmpPlugin(dir string, global, force bool) int {
 	fmt.Println("  2. send a message if the session is new (a fresh `amp` has no thread yet)")
 	fmt.Println("  3. Ctrl+O → 'amp-bridge: Enable Claude inbox for this thread'")
 	fmt.Println()
-	fmt.Println("Then ask_amp can reach that thread even while it is open.")
+	fmt.Println("For an Amp-managed/background target, use 'Enable Claude inbox for another thread'")
+	fmt.Println("from a local Amp thread and paste the target URL or id.")
+	fmt.Println()
+	fmt.Println("That one enable survives plugin reloads and local Amp process restarts until disabled.")
+	fmt.Println("Claude can append requests whenever that local thread is open.")
+	fmt.Println("Amp must already be active or the user must start the queued turn.")
 	return 0
 }

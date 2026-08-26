@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // fakePlugin stands in for the Amp plugin: it serves the inbox protocol over a
@@ -17,14 +18,15 @@ import (
 // without Amp, a live session, or a human at a keyboard — which is the whole
 // point of keeping tier one separate from tier three.
 type fakePlugin struct {
-	t        *testing.T
-	sock     string
-	ln       net.Listener
-	threads  []string
-	proto    int
-	reply    inboxReply // what to answer an ask with
-	hangup   bool       // close without answering, to test EOF mid-request
-	askFrame chan []byte
+	t         *testing.T
+	sock      string
+	ln        net.Listener
+	threads   []string
+	proto     int
+	reply     inboxReply // what to answer an ask with
+	hangup    bool       // close without answering, to test EOF mid-request
+	replyGate <-chan struct{}
+	askFrame  chan []byte
 }
 
 func newFakePlugin(t *testing.T, threads ...string) *fakePlugin {
@@ -85,6 +87,9 @@ func (p *fakePlugin) handle(conn net.Conn) {
 		if p.hangup {
 			return // close without answering
 		}
+		if p.replyGate != nil {
+			<-p.replyGate
+		}
 		r := p.reply
 		r.ID = op.ID
 		_ = json.NewEncoder(conn).Encode(r)
@@ -93,7 +98,7 @@ func (p *fakePlugin) handle(conn net.Conn) {
 
 // inboxHarness builds a bridge whose runtime dir is a private temp tree, and
 // optionally registers one plugin entry for threadID.
-func inboxHarness(t *testing.T, p *fakePlugin, threadID string) *harness {
+func inboxHarness(t *testing.T, p *fakePlugin, threadID string, mutate ...func(*config)) *harness {
 	t.Helper()
 	runtime := shortTempDir(t)
 	t.Setenv("AMP_BRIDGE_DIR", runtime)
@@ -117,11 +122,12 @@ func inboxHarness(t *testing.T, p *fakePlugin, threadID string) *harness {
 	// A fail-fast amp: if the CLI path is taken when it should not be, the test
 	// sees a distinctive error rather than a silent success.
 	bin := fakeAmp(t, `echo "CLI-WAS-SPAWNED" >&2; exit 9`)
-	return newHarness(t, func(c *config) {
+	base := func(c *config) {
 		c.ampDisabled = false
 		c.ampBin = bin
 		c.ampTimeout = 60 * time.Second
-	})
+	}
+	return newHarness(t, append([]func(*config){base}, mutate...)...)
 }
 
 func TestInboxLookupHitAndAsk(t *testing.T) {
@@ -165,6 +171,163 @@ func TestInboxLookupHitAndAsk(t *testing.T) {
 		}
 	default:
 		t.Fatal("plugin never received an ask frame")
+	}
+}
+
+func TestInboxRequestsAreNotSerializedByTheCLIMutex(t *testing.T) {
+	gate := make(chan struct{})
+	p := newFakePlugin(t, "T-open")
+	p.replyGate = gate
+	h := inboxHarness(t, p, "T-open")
+
+	type result struct {
+		out string
+		err error
+	}
+	results := make(chan result, 2)
+	for _, text := range []string{"first", "second"} {
+		go func(text string) {
+			out, err := h.b.askAmp("T-open", text)
+			results <- result{out, err}
+		}(text)
+	}
+
+	for i := range 2 {
+		select {
+		case <-p.askFrame:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d inbox request(s) arrived before the first completed; a Go-side mutex is serialising the plugin's own queue", i)
+		}
+	}
+	close(gate)
+	for range 2 {
+		if got := <-results; got.err != nil || got.out != "from amp" {
+			t.Errorf("askAmp = %q, %v", got.out, got.err)
+		}
+	}
+}
+
+func TestSendAmpReturnsImmediatelyAndPushesACompletion(t *testing.T) {
+	p := newFakePlugin(t, "T-open")
+	h := inboxHarness(t, p, "T-open")
+	h.b.rememberThread("T-paired")
+
+	h.call(t, sendAmpCall("sa", "T-open", "do the review"))
+	res := result(t, h.response(t, "sa"))
+	if isToolError(t, res) || !strings.Contains(toolText(t, res), "amp-async-") {
+		t.Fatalf("send_amp did not return an async handle: %v", res)
+	}
+	waitFor(t, "the async completion event", func() bool { return len(h.notifications(t)) == 1 })
+
+	params, _ := h.notifications(t)[0]["params"].(map[string]any)
+	meta, _ := params["meta"].(map[string]any)
+	if meta["status"] != "done" || meta["thread_id"] != "T-open" {
+		t.Errorf("completion metadata = %v", meta)
+	}
+	if id, _ := meta["async_id"].(string); !strings.HasPrefix(id, "amp-async-") {
+		t.Errorf("async_id = %v", meta["async_id"])
+	}
+	if _, ok := meta["request_id"]; ok {
+		t.Error("a completion must not carry request_id; no Amp caller is waiting for reply")
+	}
+	if content, _ := params["content"].(string); !strings.Contains(content, "from amp") || !strings.Contains(content, "No reply is required") {
+		t.Errorf("completion content = %q", content)
+	}
+	if h.b.pendingCount() != 0 {
+		t.Errorf("send_amp allocated a reply slot; pending = %d", h.b.pendingCount())
+	}
+	if got := h.b.knownThread(); got != "T-paired" {
+		t.Errorf("send_amp rebound the default thread to %q", got)
+	}
+}
+
+func TestSendAmpPushesFailuresAsCompletionEvents(t *testing.T) {
+	p := newFakePlugin(t, "T-open")
+	p.reply = inboxReply{Error: "Amp turn failed", Code: "turn-error"}
+	h := inboxHarness(t, p, "T-open")
+
+	h.call(t, sendAmpCall("sa", "T-open", "do the review"))
+	if res := result(t, h.response(t, "sa")); isToolError(t, res) {
+		t.Fatalf("accepted async work should return a handle, not the later failure: %v", res)
+	}
+	waitFor(t, "the async failure event", func() bool { return len(h.notifications(t)) == 1 })
+	params, _ := h.notifications(t)[0]["params"].(map[string]any)
+	meta, _ := params["meta"].(map[string]any)
+	if meta["status"] != "error" {
+		t.Errorf("failure status = %v", meta["status"])
+	}
+	if content, _ := params["content"].(string); !strings.Contains(content, "failed") || !strings.Contains(content, "check thread") {
+		t.Errorf("failure content = %q", content)
+	}
+}
+
+func TestSendAmpBoundsCompletionContent(t *testing.T) {
+	p := newFakePlugin(t, "T-open")
+	p.reply = inboxReply{Reply: strings.Repeat("é", 200)}
+	h := inboxHarness(t, p, "T-open", func(c *config) { c.maxMessageBytes = 128 })
+
+	h.call(t, sendAmpCall("bounded", "T-open", "return a large result"))
+	if res := result(t, h.response(t, "bounded")); isToolError(t, res) {
+		t.Fatalf("send_amp was rejected: %v", res)
+	}
+	waitFor(t, "the bounded completion event", func() bool { return len(h.notifications(t)) == 1 })
+
+	params, _ := h.notifications(t)[0]["params"].(map[string]any)
+	content, _ := params["content"].(string)
+	if len(content) > h.b.cfg.maxMessageBytes {
+		t.Errorf("completion is %d bytes, max is %d", len(content), h.b.cfg.maxMessageBytes)
+	}
+	if !strings.Contains(content, "[truncated]") || !utf8.ValidString(content) {
+		t.Errorf("completion was not safely truncated: %q", content)
+	}
+	if !strings.Contains(h.log.String(), "SEND_AMP_COMPLETION_TRUNCATED") {
+		t.Error("truncation should log the original size")
+	}
+}
+
+func TestSendAmpIsBoundedAndShutdownCancelsIt(t *testing.T) {
+	gate := make(chan struct{})
+	t.Cleanup(func() { close(gate) })
+	p := newFakePlugin(t, "T-open")
+	p.replyGate = gate
+	h := inboxHarness(t, p, "T-open", func(c *config) { c.maxInFlight = 1 })
+
+	h.call(t, sendAmpCall("first", "T-open", "long work"))
+	if res := result(t, h.response(t, "first")); isToolError(t, res) {
+		t.Fatalf("first send_amp was rejected: %v", res)
+	}
+	select {
+	case <-p.askFrame:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first async request never reached the plugin")
+	}
+
+	h.call(t, sendAmpCall("second", "T-open", "too much"))
+	second := result(t, h.response(t, "second"))
+	if !isToolError(t, second) || !strings.Contains(toolText(t, second), "too many send_amp") {
+		t.Errorf("second request should hit the cap: %v", second)
+	}
+
+	start := time.Now()
+	h.b.drainToolWork()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("shutdown took %v; the inbox connection did not react to cancellation", elapsed)
+	}
+	if n := len(h.b.asyncSlots); n != 0 {
+		t.Errorf("shutdown leaked %d async slot(s)", n)
+	}
+	if strings.Contains(h.log.String(), "SHUTDOWN_TIMEOUT") {
+		t.Error("async work did not unwind before the shutdown bound")
+	}
+}
+
+func sendAmpCall(id, threadID, text string) map[string]any {
+	return map[string]any{
+		"jsonrpc": "2.0", "id": id, "method": "tools/call",
+		"params": map[string]any{
+			"name":      toolSendAmp,
+			"arguments": map[string]any{"text": text, "thread_id": threadID},
+		},
 	}
 }
 

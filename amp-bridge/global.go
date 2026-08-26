@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -49,11 +50,18 @@ func cmdInitGlobal() int {
 		"--scope", "user", "--", exe)
 	cmd.WaitDelay = 2 * time.Second
 	out, err := cmd.CombinedOutput()
-	if err != nil {
+	switch {
+	case err == nil:
+		fmt.Printf("registered %s for all projects (user scope)\n", serverName)
+	case mcpServerAlreadyExists(out):
+		// Upgrades routinely run init again to refresh the embedded skill. Claude
+		// refuses to replace an existing registration; keep it and let doctor
+		// report if its command points anywhere other than this binary.
+		fmt.Printf("%s already registered in Claude's user config; keeping it\n", serverName)
+	default:
 		fmt.Fprintf(os.Stderr, "amp-bridge: `claude mcp add` failed: %v\n%s\n", err, out)
 		return 1
 	}
-	fmt.Printf("registered %s for all projects (user scope)\n", serverName)
 
 	if err := installSkill(); err != nil {
 		// Not fatal: the bridge works without the skill, Claude just has to be
@@ -70,6 +78,10 @@ func cmdInitGlobal() int {
 	fmt.Println("Then:")
 	fmt.Println("  " + serverName + " doctor")
 	return 0
+}
+
+func mcpServerAlreadyExists(out []byte) bool {
+	return strings.Contains(strings.ToLower(string(out)), "mcp server "+serverName+" already exists")
 }
 
 func installSkill() error {

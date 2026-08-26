@@ -9,8 +9,8 @@
  * answer back.
  *
  * Nothing happens until you ask for it. Loading this file binds no socket,
- * writes no file and touches no directory. One palette command per thread turns
- * it on; disabling the last one takes everything back down.
+ * writes no file and touches no directory. Palette commands opt in either the
+ * active thread or a named managed thread, and disabling revokes that consent.
  *
  *   Ctrl+O → "amp-bridge: Enable Claude inbox for this thread"
  *
@@ -25,12 +25,14 @@ import type {
   PluginAPI,
   AgentStartEvent,
   AgentEndEvent,
+  SessionStartEvent,
   PluginCommandContext,
   CommandSubscription,
 } from '@ampcode/plugin'
 import * as net from 'node:net'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import { execFileSync } from 'node:child_process'
 
 const PROTO = 1
 
@@ -113,17 +115,18 @@ export default function (amp: PluginAPI) {
   const sockPath = path.join(inboxDir, `plugin-${process.pid}.sock`)
   const logPath = path.join(inboxDir, 'plugin.log')
 
-  // Identifies this *process* across a plugin reload. Module state does not
-  // survive a reload, and process.pid alone is not enough: a later process that
-  // reuses the pid would inherit intents it never consented to, and this design
-  // has been bitten by fixed names in shared namespaces three times already.
-  // Deriving the start instant from uptime gives a value stable across reloads
-  // and distinct per process. Clock drift only ever loses a re-arm, which is
-  // the safe direction — you re-enable by hand.
+  // The plugin WORKER is replaced on every reload; its parent Amp host survives.
+  // Host identity lets a reload restore every inbox that host already served.
+  // Consent itself belongs to the THREAD, though: a later Amp host may claim it
+  // only after activeThread/session.start proves that exact thread opened there.
+  const AMP_HOST_PID = process.ppid
+  const AMP_HOST_STARTED_AT = processStartedAt(AMP_HOST_PID)
+
+  // Live registrations belong to this worker's socket, unlike durable intent.
   const PROCESS_STARTED_AT = Math.round(Date.now() - process.uptime() * 1000)
-  const START_TOLERANCE_MS = 2_000
 
   const enabled = new Map<string, true>()
+  const controllers = new Map<string, string>()
   const lanes = new Map<string, Lane>()
   const clients = new Set<net.Socket>()
   let server: net.Server | null = null
@@ -131,6 +134,8 @@ export default function (amp: PluginAPI) {
 
   let enableCmd: CommandSubscription | null = null
   let disableCmd: CommandSubscription | null = null
+  let enableManagedCmd: CommandSubscription | null = null
+  let disableManagedCmd: CommandSubscription | null = null
 
   // ---- diagnostics -------------------------------------------------------
   // Only ever writes after the directory exists, i.e. after an explicit enable.
@@ -213,19 +218,25 @@ export default function (amp: PluginAPI) {
     return path.join(intentDir, `${threadID}.json`)
   }
 
-  // Survives dispose. Removed only when the user explicitly disables the thread,
-  // or when its owning process is provably gone.
-  function writeIntent(threadID: string): void {
+  // Survives worker and Amp-host restarts. Removed only when the user explicitly
+  // disables the thread or the runtime directory itself is cleaned.
+  function writeIntent(
+    threadID: string,
+    enabledAt?: string,
+    controllerThreadID?: string,
+  ): void {
     ensureDir(intentDir)
     writeFileAtomic(
       intentPath(threadID),
       JSON.stringify(
         {
           thread_id: threadID,
-          plugin_pid: process.pid,
-          plugin_started_at: PROCESS_STARTED_AT,
-          enabled_at: new Date().toISOString(),
-          note: 'amp-bridge plugin inbox; the user enabled this thread. Not read by ask_amp.',
+          amp_pid: AMP_HOST_PID,
+          amp_started_at: AMP_HOST_STARTED_AT,
+          enabled_at: enabledAt || new Date().toISOString(),
+          ...(controllerThreadID ? { controller_thread_id: controllerThreadID } : {}),
+          note:
+            'amp-bridge plugin inbox; the user enabled this thread until explicitly disabled. Not read by ask_amp.',
         },
         null,
         2,
@@ -241,15 +252,30 @@ export default function (amp: PluginAPI) {
     }
   }
 
-  // Alive means "exists and is not ours to reap". EPERM is a live process owned
-  // by somebody else, which must not be treated as absent.
-  function pidAlive(pid: number): boolean {
-    if (!Number.isInteger(pid) || pid <= 0) return false
+  function threadIDFromInput(input: string): string | null {
+    const value = input.trim()
+    if (!value) return null
+
+    let candidate = value
     try {
-      process.kill(pid, 0)
-      return true
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code === 'EPERM'
+      const url = new URL(value)
+      candidate = url.pathname.split('/').filter(Boolean).at(-1) || ''
+    } catch {
+      // A bare thread id is the normal input; URL parsing is only convenience.
+    }
+    return candidate.startsWith('T-') && THREAD_ID_RE.test(candidate) ? candidate : null
+  }
+
+  function processStartedAt(pid: number): string | null {
+    try {
+      const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+        encoding: 'utf8',
+        env: { ...process.env, LC_ALL: 'C' },
+        timeout: 1_000,
+      }).trim()
+      return out || null
+    } catch {
+      return null
     }
   }
 
@@ -402,11 +428,20 @@ export default function (amp: PluginAPI) {
     }
 
     log(`NO_TURN req=${req.id} thread=${threadID} state=${String(state)}`)
+    const controllerThreadID = controllers.get(threadID)
+    if (controllerThreadID) {
+      void amp.ui
+        .notify(
+          `amp-bridge: Claude queued a request for managed thread ${threadID}, but Amp did not start a turn. ` +
+            `Continue that thread to process it; do not ask Claude to resend.`,
+        )
+        .catch((err) => log(`CONTROLLER_NOTIFY_FAIL thread=${threadID} ${String(err)}`))
+    }
     respond(req, {
       error:
         `the message was appended to thread ${threadID} but Amp did not start a turn ` +
-        `for it (thread state: ${String(state)}). It is sitting in the thread unanswered; ` +
-        `ask your user to open that thread and reply there`,
+        `for it (thread state: ${String(state)}). It is queued in the thread but unanswered ` +
+        `for now; the next activity in that thread may pick it up. Ask your user to continue there`,
       code: 'no-turn',
     })
     releaseLane(threadID, req)
@@ -448,15 +483,39 @@ export default function (amp: PluginAPI) {
     const req = l?.inflight
     if (!req || !req.appended) return
 
+    const messages = event.messages || []
+    const markerIndex = messages.findIndex(
+      (message: { role: string; content?: { type: string; text?: string }[] }) =>
+        message.role === 'user' &&
+        (message.content || []).some(
+          (block) =>
+            block.type === 'text' &&
+            typeof block.text === 'string' &&
+            block.text.includes(req.marker),
+        ),
+    )
     const matched =
-      (req.turnMsgId !== null && event.id === req.turnMsgId) || event.message.includes(req.marker)
+      (req.turnMsgId !== null && event.id === req.turnMsgId) ||
+      event.message.includes(req.marker) ||
+      markerIndex >= 0
     if (!matched) return
 
     try {
-      const assistants = (event.messages || []).filter((m: { role: string }) => m.role === 'assistant')
+      // `steer: true` can inject the marked message into a turn that started
+      // before this request existed. That path has no second agent.start event,
+      // so agent.end's messages are the first place correlation is observable.
+      // Ignore assistants from before the marker or their pre-steer commentary
+      // could be mistaken for the answer.
+      const relevantMessages = markerIndex >= 0 ? messages.slice(markerIndex + 1) : messages
+      const assistants = relevantMessages.filter((m: { role: string }) => m.role === 'assistant')
+      if (markerIndex >= 0 && req.turnMsgId === null) {
+        if (req.noTurn) clearTimeout(req.noTurn)
+        req.noTurn = null
+        log(`END_MATCHED_STEER id=${String(event.id)} req=${req.id} marker_index=${markerIndex}`)
+      }
       log(
         `END_CAPTURED id=${String(event.id)} req=${req.id} status=${event.status} ` +
-          `messages=${(event.messages || []).length} assistants=${assistants.length}`,
+          `messages=${messages.length} assistants=${assistants.length}`,
       )
 
       if (event.status !== 'done') {
@@ -545,7 +604,8 @@ export default function (amp: PluginAPI) {
           id,
           error:
             `thread ${threadID} has not enabled its Claude inbox — press Ctrl+O in that ` +
-            `Amp session and run 'amp-bridge: Enable Claude inbox for this thread'`,
+            `Amp session and run 'amp-bridge: Enable Claude inbox for this thread', or from ` +
+            `another local Amp session run 'amp-bridge: Enable Claude inbox for another thread'`,
           code: 'not-enabled',
         }) + '\n',
       )
@@ -743,6 +803,41 @@ export default function (amp: PluginAPI) {
     unlinkOwnSocket()
   }
 
+  async function enableThread(
+    threadID: string,
+    controllerThreadID?: string,
+  ): Promise<string | null> {
+    if (enabled.has(threadID)) return null
+    if (!server) {
+      try {
+        await startServer()
+      } catch (err) {
+        return `could not listen — ${String(err)}`
+      }
+    }
+    try {
+      writeEntry(threadID)
+    } catch (err) {
+      if (enabled.size === 0) await stopServer()
+      return `could not register the thread — ${String(err)}`
+    }
+    try {
+      writeIntent(threadID, undefined, controllerThreadID)
+    } catch (err) {
+      // Not fatal: the live route works for this host, but say so in the log so
+      // a later reload failure has a cause rather than looking like lost consent.
+      log(`INTENT_WRITE_FAIL thread=${threadID} ${String(err)}`)
+    }
+    enabled.set(threadID, true)
+    if (controllerThreadID) controllers.set(threadID, controllerThreadID)
+    log(
+      `ENABLED thread=${threadID}` +
+        (controllerThreadID ? ` controller=${controllerThreadID}` : ''),
+    )
+    refreshAvailability()
+    return null
+  }
+
   // ---- commands ----------------------------------------------------------
   function refreshAvailability(): void {
     if (disposed) return
@@ -753,6 +848,11 @@ export default function (amp: PluginAPI) {
         reason: `needs a local executor (running on: ${String(kind)})`,
       })
       disableCmd?.setAvailability({ type: 'hidden' })
+      enableManagedCmd?.setAvailability({
+        type: 'disabled',
+        reason: `needs a local executor (running on: ${String(kind)})`,
+      })
+      disableManagedCmd?.setAvailability({ type: 'hidden' })
       return
     }
     const active = amp.activeThread?.current
@@ -762,11 +862,22 @@ export default function (amp: PluginAPI) {
         reason: 'send the first message in this session, then enable',
       })
       disableCmd?.setAvailability({ type: 'hidden' })
+      enableManagedCmd?.setAvailability({
+        type: 'disabled',
+        reason: 'send the first message in this session, then enable',
+      })
+      disableManagedCmd?.setAvailability({ type: 'hidden' })
       return
     }
     const on = enabled.has(active.id as unknown as string)
-    enableCmd?.setAvailability(on ? { type: 'hidden' } : { type: 'enabled' })
+    enableCmd?.setAvailability(
+      on
+        ? { type: 'disabled', reason: 'already enabled; use “Disable Claude inbox for this thread” to turn it off' }
+        : { type: 'enabled' },
+    )
     disableCmd?.setAvailability(on ? { type: 'enabled' } : { type: 'hidden' })
+    enableManagedCmd?.setAvailability({ type: 'enabled' })
+    disableManagedCmd?.setAvailability({ type: 'enabled' })
   }
 
   enableCmd = amp.registerCommand(
@@ -796,36 +907,91 @@ export default function (amp: PluginAPI) {
         return
       }
 
-      if (!server) {
-        try {
-          await startServer()
-        } catch (err) {
-          // Never half-enable: no socket means no entry, so the Go side sees a
-          // clean absence rather than a registration pointing at nothing.
-          await ctx.ui.notify(`amp-bridge: could not listen — ${String(err)}`)
-          return
-        }
-      }
-      try {
-        writeEntry(threadID)
-      } catch (err) {
-        await ctx.ui.notify(`amp-bridge: could not register the thread — ${String(err)}`)
-        if (enabled.size === 0) await stopServer()
+      const error = await enableThread(threadID)
+      if (error) {
+        await ctx.ui.notify(`amp-bridge: ${error}`)
         return
       }
-      try {
-        writeIntent(threadID)
-      } catch (err) {
-        // Not fatal: the thread is enabled for this load, it just will not come
-        // back by itself after a reload. Losing the convenience must not cost
-        // the enable the user actually asked for.
-        log(`INTENT_WRITE_FAIL thread=${threadID} ${String(err)}`)
-      }
-      enabled.set(threadID, true)
-      log(`ENABLED thread=${threadID}`)
-      refreshAvailability()
       await ctx.ui.notify(
-        `Claude inbox enabled for this thread.\nsocket: ${sockPath}\nA paired Claude session can now use ask_amp.`,
+        `Claude inbox enabled for this thread.\nsocket: ${sockPath}\n` +
+          `This survives plugin and Amp process restarts until you disable it.\n` +
+          `A paired Claude session can append requests; Amp must start each queued turn.`,
+      )
+    },
+  )
+
+  enableManagedCmd = amp.registerCommand(
+    'enable-claude-inbox-for-thread',
+    {
+      title: 'Enable Claude inbox for another thread',
+      category: 'amp-bridge',
+      description: 'Pair a managed or background Amp thread by URL or thread id',
+    },
+    async (ctx: PluginCommandContext) => {
+      const controllerThreadID = ctx.thread?.id as unknown as string | undefined
+      if (!controllerThreadID || !THREAD_ID_RE.test(controllerThreadID)) {
+        await ctx.ui.notify(
+          'amp-bridge: send a message in this local session first; it will control the managed inbox',
+        )
+        return
+      }
+      const kind = (amp as { system?: { executor?: { kind?: string } } }).system?.executor?.kind
+      if (kind !== 'local') {
+        await ctx.ui.notify(`amp-bridge: needs a local executor (running on: ${String(kind)})`)
+        return
+      }
+
+      const input = await ctx.ui.input({
+        title: 'Enable Claude inbox for another thread',
+        helpText: 'Paste an Amp thread URL or T-… id. This local thread will be its inbox controller.',
+        submitButtonText: 'Continue',
+      })
+      if (input === undefined) return
+      const threadID = threadIDFromInput(input)
+      if (!threadID) {
+        await ctx.ui.notify('amp-bridge: enter a valid Amp thread URL or T-… id')
+        return
+      }
+      if (threadID === controllerThreadID) {
+        await ctx.ui.notify(
+          "amp-bridge: that is this thread — use 'Enable Claude inbox for this thread' instead",
+        )
+        return
+      }
+      if (enabled.has(threadID)) {
+        await ctx.ui.notify(`amp-bridge: thread ${threadID} already has an inbox in this Amp session`)
+        return
+      }
+
+      try {
+        await Promise.race([
+          amp.threads.get(threadID as never).state.get(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('thread lookup timed out')), 2_000),
+          ),
+        ])
+      } catch (err) {
+        await ctx.ui.notify(`amp-bridge: could not resolve thread ${threadID} — ${String(err)}`)
+        return
+      }
+      const confirmed = await ctx.ui.confirm({
+        title: 'Enable inbox for managed thread?',
+        message:
+          `Claude sessions on this machine will be able to append requests to **${threadID}**.\n\n` +
+          `The consent is controlled by this Amp thread (**${controllerThreadID}**) and remains until explicitly disabled.`,
+        confirmButtonText: 'Enable inbox',
+      })
+      if (!confirmed) return
+
+      const error = await enableThread(threadID, controllerThreadID)
+      if (error) {
+        await ctx.ui.notify(`amp-bridge: ${error}`)
+        return
+      }
+      await ctx.ui.notify(
+        `Claude inbox enabled for managed thread ${threadID}.\n` +
+          `controller: ${controllerThreadID}\n` +
+          `This survives plugin reloads and returns when this controller thread reopens.`,
       )
     },
   )
@@ -848,8 +1014,105 @@ export default function (amp: PluginAPI) {
     },
   )
 
+  disableManagedCmd = amp.registerCommand(
+    'disable-claude-inbox-for-thread',
+    {
+      title: 'Disable Claude inbox for another thread',
+      category: 'amp-bridge',
+      description: 'Revoke a managed or background thread pairing by URL or thread id',
+    },
+    async (ctx: PluginCommandContext) => {
+      const controllerThreadID = ctx.thread?.id as unknown as string | undefined
+      if (!controllerThreadID) {
+        await ctx.ui.notify('amp-bridge: no active controller thread')
+        return
+      }
+      const input = await ctx.ui.input({
+        title: 'Disable Claude inbox for another thread',
+        helpText: 'Paste the Amp thread URL or T-… id whose managed inbox this thread controls.',
+        submitButtonText: 'Disable inbox',
+      })
+      if (input === undefined) return
+      const threadID = threadIDFromInput(input)
+      if (!threadID) {
+        await ctx.ui.notify('amp-bridge: enter a valid Amp thread URL or T-… id')
+        return
+      }
+      if (!enabled.has(threadID)) {
+        let dormantController: string | null = null
+        try {
+          const saved = JSON.parse(fs.readFileSync(intentPath(threadID), 'utf8')) as {
+            controller_thread_id?: unknown
+          }
+          if (
+            typeof saved.controller_thread_id === 'string' &&
+            THREAD_ID_RE.test(saved.controller_thread_id)
+          ) {
+            dormantController = saved.controller_thread_id
+          }
+        } catch {
+          // The command may run from a different host after the original
+          // controller was deleted. Only a readable managed intent is safe to
+          // forget here; ordinary consent must still be revoked from its thread.
+        }
+        if (!dormantController) {
+          await ctx.ui.notify(
+            `amp-bridge: ${threadID} does not have a readable dormant managed inbox pairing`,
+          )
+          return
+        }
+        const confirmed = await ctx.ui.confirm({
+          title: 'Forget dormant managed inbox?',
+          message:
+            `Managed thread **${threadID}** is not active in this Amp session. ` +
+            `Its recorded controller is **${dormantController}**.\n\n` +
+            `Forget its saved consent so it cannot be re-armed later?`,
+          confirmButtonText: 'Forget pairing',
+        })
+        if (!confirmed) return
+        // Revocation is safe from any explicit local palette action: it only
+        // removes access. Removing the live entry too makes the revocation take
+        // effect if another host left a stale registration behind.
+        removeEntry(threadID)
+        removeIntent(threadID)
+        log(
+          `FORGOT_MANAGED thread=${threadID} former_controller=${dormantController} ` +
+            `requested_by=${controllerThreadID}`,
+        )
+        await ctx.ui.notify(
+          `Claude inbox pairing forgotten for dormant managed thread ${threadID}.`,
+        )
+        return
+      }
+
+      const controller = controllers.get(threadID)
+      if (!controller) {
+        await ctx.ui.notify(
+          `amp-bridge: ${threadID} is not a managed inbox; disable it from that thread instead`,
+        )
+        return
+      }
+      if (controller !== controllerThreadID) {
+        const confirmed = await ctx.ui.confirm({
+          title: 'Disable managed inbox controlled by another thread?',
+          message:
+            `Managed thread **${threadID}** is controlled by **${controller}**, not this thread ` +
+            `(**${controllerThreadID}**).\n\nDisable it anyway? Revocation only removes access.`,
+          confirmButtonText: 'Disable inbox',
+        })
+        if (!confirmed) return
+        await disableThread(threadID, 'explicitly disabled from another local thread')
+        await ctx.ui.notify(`Claude inbox disabled for managed thread ${threadID}.`)
+        return
+      }
+      await disableThread(threadID, 'disabled from its controller thread')
+      await ctx.ui.notify(`Claude inbox disabled for managed thread ${threadID}.`)
+    },
+  )
+
   async function disableThread(threadID: string, why: string): Promise<void> {
     enabled.delete(threadID)
+    controllers.delete(threadID)
     const l = lanes.get(threadID)
     if (l) {
       const all = [l.inflight, ...l.queue].filter(Boolean) as ReqState[]
@@ -872,10 +1135,12 @@ export default function (amp: PluginAPI) {
   }
 
   // ---- lifecycle ---------------------------------------------------------
-  amp.on('session.start', () => {
-    // No bookkeeping: session.start has no matching close event, so anything
-    // derived from it could only mean "seen since load", which is unsound.
+  amp.on('session.start', (event: SessionStartEvent) => {
     refreshAvailability()
+    // Unlike threads.get(id), this event proves the current Amp host actually
+    // opened this thread. That is the safe point at which a consent recorded by
+    // a previous host can be claimed after an Amp restart.
+    queueRearm(event.thread.id as unknown as string, 'session-start')
   })
 
   amp.activeThread?.subscribe(() => refreshAvailability())
@@ -902,6 +1167,7 @@ export default function (amp: PluginAPI) {
     for (const threadID of enabled.keys()) removeEntry(threadID)
     lanes.clear()
     enabled.clear()
+    controllers.clear()
 
     // end() queues the frame, destroy() would discard it. Grace, then force.
     // If the grace expires the caller sees EOF and ambiguous delivery — the
@@ -921,29 +1187,31 @@ export default function (amp: PluginAPI) {
     // would block past the dispose budget and leave the socket bound.
     await stopServer()
 
-    // Release the load guard LAST. It exists to stop a second copy initialising
-    // in the same process, but load_plugin disposes and re-evaluates in that
-    // same process — so leaving it set meant the reloaded copy took the early
-    // return and came back completely inert: no commands, no socket, no way to
-    // notice short of ask_amp failing. Clearing it here keeps the duplicate-copy
-    // protection (the second copy of a given load still sees it set) while
-    // letting a reload actually reload.
+    // Release the load guard LAST. Current Amp builds replace the worker process
+    // on reload, but clearing it also keeps in-process module re-evaluation safe
+    // in tests and compatible runtimes.
     delete g[LOAD_GUARD]
     log('DISPOSE_DONE')
   })
 
-  // ---- re-arm across a reload -------------------------------------------
-  // load_plugin disposes and re-evaluates this module in the same process, so
-  // without this every reload silently drops every inbox and the user finds out
-  // when ask_amp fails. Intents record the decision; this restores it.
+  // ---- re-arm across reloads and Amp restarts ----------------------------
+  // The intent is durable per-thread consent. A plugin reload under the same Amp
+  // host restores all inboxes that host served. A different host may claim only
+  // the exact thread proven by activeThread or session.start; merely resolving
+  // threads.get(id) is not ownership because Amp synchronizes threads globally.
   //
-  // The gate is deliberately narrow. Only intents written by THIS process, as
-  // identified by pid and start instant together, are re-armed. A different pid
-  // belongs to another live Amp; the same pid with a different start instant is
-  // a previous process whose pid we inherited, and arming from that would enable
-  // a thread this session never consented to. Everything else is left alone, or
-  // swept once its owner is provably gone.
-  async function rearmFromIntents(): Promise<void> {
+  // Rearms are serialized because load, active session startup and plugin events
+  // can converge. Two concurrent startServer calls would race to bind one socket.
+  let rearmSerial: Promise<void> = Promise.resolve()
+  let hostIdentityLogged = false
+
+  function queueRearm(onlyThreadID?: string, trigger = 'load'): void {
+    rearmSerial = rearmSerial
+      .then(() => rearmFromIntents(onlyThreadID, trigger))
+      .catch((err) => log(`REARM_ERROR trigger=${trigger} ${String(err)}`))
+  }
+
+  async function rearmFromIntents(onlyThreadID?: string, trigger = 'load'): Promise<void> {
     let names: string[]
     try {
       names = fs.readdirSync(intentDir)
@@ -951,44 +1219,89 @@ export default function (amp: PluginAPI) {
       return // nothing has ever been enabled; stay inert
     }
 
+    if (!hostIdentityLogged) {
+      hostIdentityLogged = true
+      log(
+        `HOST_IDENTITY amp_pid=${AMP_HOST_PID} ` +
+          `started_at=${AMP_HOST_STARTED_AT === null ? 'unavailable' : JSON.stringify(AMP_HOST_STARTED_AT)}`,
+      )
+    }
+
     // A session that has moved to a remote executor cannot serve an inbox, and
     // 'unknown' is not evidence of that — refusing on it would lose re-arms to a
     // race with Amp's own startup, which is the opposite of the point.
+    // executor.kind is readonly and the plugin API exposes no transition event;
+    // session.start rechecks it whenever a thread session starts.
     const kind = (amp as { system?: { executor?: { kind?: string } } }).system?.executor?.kind
     if (kind === 'remote') {
       log('REARM_SKIP executor=remote')
       return
     }
 
+    const activeThreadID = amp.activeThread?.current?.id as unknown as string | undefined
     let armed = 0
+    let deferred = 0
     for (const name of names) {
       if (disposed) return
       if (!name.endsWith('.json')) continue
       const threadID = name.slice(0, -'.json'.length)
       if (!THREAD_ID_RE.test(threadID)) continue
+      if (enabled.has(threadID)) continue
 
-      let intent: { plugin_pid?: unknown; plugin_started_at?: unknown }
+      let intent: {
+        amp_pid?: unknown
+        amp_started_at?: unknown
+        enabled_at?: unknown
+        controller_thread_id?: unknown
+        plugin_pid?: unknown
+        plugin_started_at?: unknown
+      }
       try {
         intent = JSON.parse(fs.readFileSync(path.join(intentDir, name), 'utf8'))
       } catch {
         continue // unreadable or half-written; leave it for its owner
       }
-      const pid = Number(intent.plugin_pid)
-      const startedAt = Number(intent.plugin_started_at)
+      const hostPID = Number(intent.amp_pid)
+      const hostStartedAt = typeof intent.amp_started_at === 'string' ? intent.amp_started_at : null
+      const controllerThreadID =
+        typeof intent.controller_thread_id === 'string' &&
+        THREAD_ID_RE.test(intent.controller_thread_id)
+          ? intent.controller_thread_id
+          : undefined
 
-      if (pid !== process.pid) {
-        // Another Amp's decision. Sweep only if that process is gone; a live one
-        // is entitled to its intent even though its socket is not ours to see.
-        if (!pidAlive(pid)) removeIntent(threadID)
+      if (onlyThreadID && threadID !== onlyThreadID && controllerThreadID !== onlyThreadID) {
         continue
       }
-      if (!Number.isFinite(startedAt) || Math.abs(startedAt - PROCESS_STARTED_AT) > START_TOLERANCE_MS) {
-        // Our pid, someone else's process. That process cannot still be running,
-        // because we are holding its pid.
-        log(`REARM_SKIP thread=${threadID} pid-reuse (intent start ${startedAt})`)
-        removeIntent(threadID)
+
+      const sameHost =
+        Number.isInteger(hostPID) &&
+        hostPID === AMP_HOST_PID &&
+        AMP_HOST_STARTED_AT !== null &&
+        hostStartedAt === AMP_HOST_STARTED_AT
+      // A managed intent is owned only through its controller. Letting the
+      // target itself also prove ownership would permit two hosts to claim the
+      // same registration when target and controller are open separately.
+      const openedHere =
+        controllerThreadID === undefined &&
+        ((trigger === 'session-start' && threadID === onlyThreadID) ||
+          (!onlyThreadID && threadID === activeThreadID))
+      const controllerOpenedHere =
+        controllerThreadID !== undefined &&
+        ((trigger === 'session-start' && controllerThreadID === onlyThreadID) ||
+          (!onlyThreadID && controllerThreadID === activeThreadID))
+
+      if (!sameHost && !openedHere && !controllerOpenedHere) {
+        // Consent is not stale merely because its last host exited. Keep it for
+        // the next session.start of this exact thread; absence of ownership is
+        // not evidence that the user revoked their decision.
+        deferred++
         continue
       }
+
+      // Amp enforces one executor per ownership thread (target for a normal
+      // consent, controller for a managed consent), so two live hosts cannot
+      // both satisfy this proof. If that invariant ever changes, the single
+      // threads/<id>.json registration will need explicit arbitration.
 
       if (!server) {
         try {
@@ -1006,9 +1319,25 @@ export default function (amp: PluginAPI) {
         log(`REARM_FAIL thread=${threadID} ${String(err)}`)
         continue
       }
+
+      // Claim a consent from an older host, and migrate legacy worker-owned
+      // intents, only after the live entry is safely in place. Preserve when the
+      // user originally enabled it; a re-arm is not a new consent decision.
+      if (!sameHost || intent.plugin_pid !== undefined || intent.plugin_started_at !== undefined) {
+        try {
+          writeIntent(
+            threadID,
+            typeof intent.enabled_at === 'string' ? intent.enabled_at : undefined,
+            controllerThreadID,
+          )
+        } catch (err) {
+          log(`REARM_INTENT_WRITE_FAIL thread=${threadID} ${String(err)}`)
+        }
+      }
       enabled.set(threadID, true)
+      if (controllerThreadID) controllers.set(threadID, controllerThreadID)
       armed++
-      log(`REARMED thread=${threadID}`)
+      log(`REARMED thread=${threadID} trigger=${sameHost ? 'same-host' : trigger}`)
     }
 
     if (armed > 0) {
@@ -1018,11 +1347,12 @@ export default function (amp: PluginAPI) {
       // the resting state; do not leave a socket bound serving nothing.
       await stopServer()
     }
+    if (deferred > 0) log(`REARM_DEFERRED count=${deferred} trigger=${trigger}`)
   }
 
   refreshAvailability()
 
   // Fire and forget: a failure here costs convenience, never correctness, and
   // must not stop the plugin loading.
-  void rearmFromIntents().catch((err) => log(`REARM_ERROR ${String(err)}`))
+  queueRearm()
 }

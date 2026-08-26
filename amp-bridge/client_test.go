@@ -83,12 +83,22 @@ func TestCmdListExitCodes(t *testing.T) {
 	dir := shortTempDir(t)
 	t.Setenv("AMP_BRIDGE_DIR", dir)
 
-	if got := cmdList(); got != 1 {
+	if got := cmdList(false); got != 1 {
 		t.Errorf("cmdList with nothing live = %d, want 1 so scripts can branch on it", got)
 	}
 	listenAs(t, dir, "alpha")
-	if got := cmdList(); got != 0 {
+	if got := cmdList(false); got != 0 {
 		t.Errorf("cmdList with a live bridge = %d, want 0", got)
+	}
+}
+
+func TestValueOrDash(t *testing.T) {
+	t.Parallel()
+	if got := valueOrDash(""); got != "-" {
+		t.Errorf("valueOrDash(empty) = %q, want -", got)
+	}
+	if got := valueOrDash("v0.2.0"); got != "v0.2.0" {
+		t.Errorf("valueOrDash(value) = %q", got)
 	}
 }
 
@@ -104,6 +114,11 @@ func TestRunDispatch(t *testing.T) {
 		{"unknown flag", []string{"--bogus"}, 2},
 		{"list with nothing live", []string{"--list"}, 1},
 		{"ask with nothing live", []string{"--ask", "hello"}, 2},
+		{
+			"ask with truncated source thread",
+			[]string{"--thread", "T-01a0335c-7794-769d-b5b4-f8a8b8bb234", "--ask", "hello"},
+			2,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

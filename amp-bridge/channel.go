@@ -25,7 +25,8 @@ func (b *bridge) pushEvent(text, threadID string) (string, chan string, error) {
 		b.pendMu.Unlock()
 		return "", nil, fmt.Errorf(
 			"too many requests in flight (%d/%d); Claude has not answered the earlier ones yet",
-			n, b.cfg.maxInFlight)
+			n, b.cfg.maxInFlight,
+		)
 	}
 	b.seq++
 	id := fmt.Sprintf("amp-%d-%d", time.Now().UnixNano(), b.seq)
@@ -45,10 +46,7 @@ func (b *bridge) pushEvent(text, threadID string) (string, chan string, error) {
 		meta["thread_id"] = threadID
 	}
 
-	if err := b.send(rpc{
-		Method: "notifications/claude/channel",
-		Params: mustJSON(map[string]any{"content": text, "meta": meta}),
-	}); err != nil {
+	if err := b.pushChannelNotification(text, meta); err != nil {
 		// The event never reached Claude, so nothing will ever answer it.
 		// Holding the slot would cost the caller the full timeout for a message
 		// that was never delivered.
@@ -58,6 +56,16 @@ func (b *bridge) pushEvent(text, threadID string) (string, chan string, error) {
 	}
 	b.logf("EVENT_PUSHED request_id=%s bytes=%d", id, len(text))
 	return id, sink, nil
+}
+
+// pushChannelNotification sends an unsolicited event without assuming it needs
+// a reply. Amp->Claude requests add request_id and own a pending slot in
+// pushEvent; send_amp completions deliberately do neither.
+func (b *bridge) pushChannelNotification(content string, meta map[string]string) error {
+	return b.send(rpc{
+		Method: "notifications/claude/channel",
+		Params: mustJSON(map[string]any{"content": content, "meta": meta}),
+	})
 }
 
 func (b *bridge) drop(id string) {
@@ -127,7 +135,7 @@ func (b *bridge) pendingCount() int {
 
 type ampRequest struct {
 	Text string `json:"text"`
-	// Optional: lets Claude reach back into this Amp thread via ask_amp.
+	// Optional: lets Claude reach back into this Amp thread via outbound tools.
 	ThreadID string `json:"thread_id,omitempty"`
 }
 

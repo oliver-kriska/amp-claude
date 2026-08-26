@@ -171,6 +171,89 @@ func TestAskAmpFallsBackToStderr(t *testing.T) {
 	}
 }
 
+func TestCLIRequestsRemainSerialized(t *testing.T) {
+	lock := filepath.Join(shortTempDir(t), "amp-running")
+	t.Setenv("AMP_TEST_LOCK", lock)
+	h := ampHarness(t, `
+if ! mkdir "$AMP_TEST_LOCK" 2>/dev/null; then
+  echo "CLI requests overlapped" >&2
+  exit 9
+fi
+sleep 0.2
+rmdir "$AMP_TEST_LOCK"
+echo ok`)
+
+	errs := make(chan error, 2)
+	for _, threadID := range []string{"T-one", "T-two"} {
+		go func(threadID string) {
+			_, err := h.b.askAmp(threadID, "work")
+			errs <- err
+		}(threadID)
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Errorf("CLI fallback lost its process bound: %v", err)
+		}
+	}
+}
+
+func TestSendAmpUsesTheCLIFallbackWithoutRebinding(t *testing.T) {
+	h := ampHarness(t, `echo "background CLI answer"`)
+	h.b.rememberThread("T-existing-pair")
+	h.b.askMu.Lock()
+	defer h.b.askMu.Unlock()
+
+	h.call(t, sendAmpCall("async-cli", "T-async-cli-fallback-test", "do independent work"))
+	res := result(t, h.response(t, "async-cli"))
+	if isToolError(t, res) || !strings.Contains(toolText(t, res), "amp-async-") {
+		t.Fatalf("send_amp did not return an async handle: %v", res)
+	}
+	// The synchronous CLI mutex is deliberately held for this whole assertion.
+	// Background work has its own bounded slots and must not queue ahead of a
+	// later foreground ask whose caller has a shorter deadline.
+	waitFor(t, "the CLI async completion event", func() bool { return len(h.notifications(t)) == 1 })
+
+	params, _ := h.notifications(t)[0]["params"].(map[string]any)
+	if content, _ := params["content"].(string); !strings.Contains(content, "background CLI answer") {
+		t.Errorf("completion omitted CLI output: %q", content)
+	}
+	if got := h.b.knownThread(); got != "T-existing-pair" {
+		t.Errorf("CLI send_amp rebound the default thread to %q", got)
+	}
+}
+
+func TestSameThreadCLIFallbackOverlapFailsLocally(t *testing.T) {
+	dir := shortTempDir(t)
+	ready := filepath.Join(dir, "ready")
+	release := filepath.Join(dir, "release")
+	t.Setenv("AMP_TEST_READY", ready)
+	t.Setenv("AMP_TEST_RELEASE", release)
+	h := ampHarness(t, `
+touch "$AMP_TEST_READY"
+while [ ! -f "$AMP_TEST_RELEASE" ]; do sleep 0.01; done
+echo done`)
+
+	background := make(chan error, 1)
+	go func() {
+		_, err := h.b.askAmpExplicit("T-same", "background")
+		background <- err
+	}()
+	waitFor(t, "the first CLI turn to start", func() bool {
+		_, err := os.Stat(ready)
+		return err == nil
+	})
+
+	if _, err := h.b.askAmp("T-same", "foreground"); err == nil || !strings.Contains(err.Error(), "already in flight in this bridge") {
+		t.Errorf("same-thread overlap should fail locally, got %v", err)
+	}
+	if err := os.WriteFile(release, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-background; err != nil {
+		t.Fatalf("first CLI turn failed: %v", err)
+	}
+}
+
 // The two log shapes below are trimmed from real amp runs captured on
 // 2026-08-19; the point of the parser is that it reads what amp actually
 // writes, so the fixtures must stay verbatim in structure.
