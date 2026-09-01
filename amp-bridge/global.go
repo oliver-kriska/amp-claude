@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -85,13 +87,30 @@ func mcpServerAlreadyExists(out []byte) bool {
 }
 
 func installSkill() error {
-	home, err := os.UserHomeDir()
+	path, err := installedSkillPath()
 	if err != nil {
 		return err
 	}
-	dir := filepath.Join(home, ".claude", "skills", serverName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillDoc), 0o600)
+	return os.WriteFile(path, []byte(skillDoc), 0o600)
+}
+
+// installedSkillPath is the single place this binary writes the skill, and the
+// single place doctor looks for it. Two constructions of the same path is how
+// an installer and its own diagnostic end up disagreeing.
+func installedSkillPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".claude", "skills", serverName, "SKILL.md"), nil
+}
+
+// skillDigest fingerprints the embedded copy so doctor can tell whether the
+// installed file came from this build.
+func skillDigest() string {
+	sum := sha256.Sum256([]byte(skillDoc))
+	return hex.EncodeToString(sum[:])[:16]
 }

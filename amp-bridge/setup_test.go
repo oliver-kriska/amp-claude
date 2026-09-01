@@ -640,3 +640,69 @@ func TestEmbeddedSkillIsPresent(t *testing.T) {
 		t.Error("embedded skill does not teach Amp to identify its source thread")
 	}
 }
+
+// The installed skill drifts with no symptom: `make setup` registers the project
+// scope and `go install` writes nothing, so only `init --global` refreshes it.
+// Claude keeps reading a previous release's protocol while every other check
+// reports green. These cases are the whole reason the check exists.
+func TestDoctorNoticesAStaleInstalledSkill(t *testing.T) {
+	// Hermetic: without this the check reads the developer's own installed
+	// skill and the verdict depends on whose machine runs the suite.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	if got := checkInstalledSkill(); got.status != statusOK {
+		t.Errorf("an uninstalled optional component must be OK, got %v: %s", got.status, got.detail)
+	}
+
+	if err := installSkill(); err != nil {
+		t.Fatalf("installSkill: %v", err)
+	}
+	if got := checkInstalledSkill(); got.status != statusOK {
+		t.Errorf("a freshly installed skill must be OK, got %v: %s", got.status, got.detail)
+	}
+
+	path, err := installedSkillPath()
+	if err != nil {
+		t.Fatalf("installedSkillPath: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("---\nname: amp-bridge\n---\nlast release\n"), 0o600); err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
+
+	got := checkInstalledSkill()
+	if got.status != statusWarn {
+		t.Fatalf("a stale installed skill must warn, got %v: %s", got.status, got.detail)
+	}
+	if !strings.Contains(got.fix, "init --global") {
+		t.Errorf("fix must name the only command that rewrites it, got %q", got.fix)
+	}
+	// Restarting matters as much as reinstalling: a session that already loaded
+	// the old text keeps using it until it starts again.
+	if !strings.Contains(got.fix, "restart") {
+		t.Errorf("fix must say the loaded sessions need restarting, got %q", got.fix)
+	}
+}
+
+// installSkill and the doctor check must never construct that path separately;
+// two spellings of one location is how an installer and its own diagnostic come
+// to disagree about whether anything is installed.
+func TestInstalledSkillPathIsUnderHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	path, err := installedSkillPath()
+	if err != nil {
+		t.Fatalf("installedSkillPath: %v", err)
+	}
+	want := filepath.Join(home, ".claude", "skills", "amp-bridge", "SKILL.md")
+	if path != want {
+		t.Errorf("installedSkillPath = %q, want %q", path, want)
+	}
+	if err := installSkill(); err != nil {
+		t.Fatalf("installSkill: %v", err)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Errorf("installSkill did not write where the check looks: %v", err)
+	}
+}

@@ -63,6 +63,7 @@ func cmdDoctor(cfg config, dir string, strict bool) int {
 		checkLiveSessions(dir),
 		checkPluginInboxes(),
 		checkInstalledPlugin(dir),
+		checkInstalledSkill(),
 		checkAmpCLI(cfg),
 		checkTimeoutOrdering(cfg),
 		checkLog(),
@@ -591,6 +592,42 @@ func classifyInbox(path string) (live bool, desc string) {
 // What matters is a copy that exists and is stale, because that is invisible:
 // Amp loads it happily, the socket appears, and only the protocol handshake or a
 // missing field eventually gives it away.
+// checkInstalledSkill catches the one drift with no symptom at all. Only
+// `init --global` writes the skill, while `make setup` registers the project
+// scope and a plain `go install` writes nothing — so the binary moves forward
+// and the installed skill does not. Claude then keeps reading a previous
+// release's protocol: a reply window that is no longer fixed, tools it has never
+// heard of, error text that no longer matches. Every other check here reports
+// green, because everything else really is fine.
+func checkInstalledSkill() check {
+	const name = "claude skill"
+
+	path, err := installedSkillPath()
+	if err != nil {
+		return check{name, statusWarn, "cannot locate the home directory: " + err.Error(), ""}
+	}
+
+	want := skillDigest()
+	have, ok := fileDigest(path)
+	switch {
+	case !ok:
+		// Optional, like the Amp plugin: the bridge works without it, Claude
+		// just has to be told how to use it every time.
+		return check{
+			name, statusOK,
+			"not installed (optional — `init --global` teaches every Claude session how to use the bridge)", "",
+		}
+	case have == want:
+		return check{name, statusOK, "current (" + want + ")", ""}
+	default:
+		return check{
+			name, statusWarn,
+			fmt.Sprintf("stale: installed %s, this build embeds %s", have, want),
+			"run `amp-bridge init --global`, then restart the Claude sessions that loaded it",
+		}
+	}
+}
+
 func checkInstalledPlugin(dir string) check {
 	const name = "amp plugin"
 	want := pluginDigest()
