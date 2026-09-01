@@ -16,7 +16,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -41,9 +41,9 @@ jobs:
             exit 1
           fi
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
-          version: 2026.8.1
+          version: 2026.8.14
 
       # GOBIN is set explicitly rather than trusting `go env GOPATH`: under mise
       # the Go toolchain is mise-managed, and the first cut of this step wrote a
@@ -71,10 +71,10 @@ jobs:
       id-token: write       # mint the OIDC token provenance is signed with
       attestations: write   # record the attestation
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
         with:
-          version: 2026.8.1
+          version: 2026.8.14
 
       # Cross-compiling needs no cgo here: the module has no dependencies and
       # the bridge uses only the standard library.
@@ -95,7 +95,7 @@ jobs:
             tar -czf "dist/amp-bridge_${version}_${os}_${arch}.tar.gz" -C "$out" .
             rm -rf "$out"
           done
-          cd dist && sha256sum *.tar.gz > checksums.txt
+          cd dist && sha256sum ./*.tar.gz > checksums.txt
 
       # install.sh verifies downloads against this file, so a wrong checksum
       # makes every install fail in a way that looks like a compromised
@@ -133,7 +133,7 @@ jobs:
 
       # Signed provenance for a binary people curl straight onto their PATH.
       # Verify with: gh attestation verify amp-bridge_*.tar.gz -R <owner>/<repo>
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.tar.gz
 

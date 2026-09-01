@@ -16,13 +16,13 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The toolchain is pinned in .tool-versions; installing it the same way
       # locally and in CI is the point of pinning it at all.
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
-          version: 2026.8.1
+          version: 2026.8.14
 
       # Not pinned in .tool-versions because it is a checker rather than part of
       # the build: nothing it reports changes the artefact, and pinning it would

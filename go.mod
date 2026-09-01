@@ -10,4 +10,4 @@ module github.com/oliver-kriska/amp-claude
 // .claude/research/2026-08-19-amp-claude-code-bridge.md §10.
 //
 // The toolchain is pinned in .tool-versions (mise).
-go 1.26.6
+go 1.27.0

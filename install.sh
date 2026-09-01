@@ -5,7 +5,7 @@
 #
 # Downloads the latest release for this platform, verifies its SHA-256 against
 # the published checksums, and installs to ~/.local/bin. Override with
-# AMP_BRIDGE_PREFIX=/usr/local, or AMP_BRIDGE_VERSION=v0.1.0 to pin a release.
+# AMP_BRIDGE_PREFIX=/usr/local, or AMP_BRIDGE_VERSION=v0.2.0 to pin a release.
 set -eu
 
 REPO="oliver-kriska/amp-claude"
