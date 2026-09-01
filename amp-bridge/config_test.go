@@ -21,6 +21,16 @@ func TestParseArgs(t *testing.T) {
 		{"version", []string{"--version"}, options{mode: modeVersion, dir: "."}},
 		{"ask", []string{"--ask", "hello"}, options{mode: modeAsk, text: "hello", dir: "."}},
 		{
+			"ask with timeout",
+			[]string{"--timeout", "10m", "--ask", "hello"},
+			options{mode: modeAsk, text: "hello", timeout: 10 * time.Minute, dir: "."},
+		},
+		{
+			"late result",
+			[]string{"--session", "b1", "--result", "amp-123-1"},
+			options{mode: modeResult, session: "b1", requestID: "amp-123-1", dir: "."},
+		},
+		{
 			"everything after --ask is the message",
 			[]string{"--ask", "what", "is", "2+2?"},
 			options{mode: modeAsk, text: "what is 2+2?", dir: "."},
@@ -69,6 +79,20 @@ func TestParseArgsErrors(t *testing.T) {
 		{"stray value", []string{"hello"}, "unknown argument"},
 		{"session without a value", []string{"--session"}, "needs a value"},
 		{"thread without a value", []string{"--thread"}, "needs a value"},
+		{"timeout without a value", []string{"--timeout"}, "needs a value"},
+		{"invalid timeout", []string{"--timeout", "later", "--ask", "hello"}, "duration"},
+		{"sub-millisecond timeout", []string{"--timeout", "1ns", "--ask", "hello"}, "at least 1ms"},
+		{"timeout without ask", []string{"--timeout", "10m"}, "only valid with --ask"},
+		{"result then ask", []string{"--result", "amp-1", "--ask", "hello"}, "cannot be combined"},
+		{"list then ask", []string{"--list", "--ask", "hello"}, "cannot be combined"},
+		{"result then list", []string{"--result", "amp-1", "--list"}, "cannot be combined"},
+		{"result without a value", []string{"--result"}, "needs a value"},
+		{"result with an empty value", []string{"--result", "  "}, "non-empty request id"},
+		{
+			"thread with result",
+			[]string{"--thread", "T-01a01877-2274-734d-8306-7c37b33f2a7f", "--result", "amp-1"},
+			"not valid with --result",
+		},
 		{"ask without a message", []string{"--ask"}, "needs a message"},
 		{"ask with only spaces", []string{"--ask", "   "}, "needs a message"},
 		{"verbose without list", []string{"--verbose"}, "only valid with --list"},
@@ -146,6 +170,7 @@ func TestEnvStr(t *testing.T) {
 func TestLoadConfigDefaults(t *testing.T) {
 	for _, k := range []string{
 		"AMP_BRIDGE_MAX_INFLIGHT", "AMP_BRIDGE_MAX_BYTES", "AMP_BRIDGE_TIMEOUT",
+		"AMP_BRIDGE_MAX_TIMEOUT", "AMP_BRIDGE_RESULT_TTL", "AMP_BRIDGE_MAX_RESULTS",
 		"AMP_BRIDGE_LOG_BODIES", "AMP_BIN", "AMP_BRIDGE_AMP_TIMEOUT",
 		"AMP_BRIDGE_DISABLE_OUTBOUND",
 	} {
@@ -157,6 +182,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 		maxInFlight:     8,
 		maxMessageBytes: 64 * 1024,
 		replyWait:       180 * time.Second,
+		maxReplyWait:    15 * time.Minute,
+		resultTTL:       time.Hour,
+		maxResults:      64,
 		logBodies:       false,
 		ampBin:          "amp",
 		ampTimeout:      120 * time.Second,
@@ -171,6 +199,9 @@ func TestLoadConfigFromEnvironment(t *testing.T) {
 	t.Setenv("AMP_BRIDGE_MAX_INFLIGHT", "3")
 	t.Setenv("AMP_BRIDGE_MAX_BYTES", "2048")
 	t.Setenv("AMP_BRIDGE_TIMEOUT", "5s")
+	t.Setenv("AMP_BRIDGE_MAX_TIMEOUT", "20s")
+	t.Setenv("AMP_BRIDGE_RESULT_TTL", "30m")
+	t.Setenv("AMP_BRIDGE_MAX_RESULTS", "12")
 	t.Setenv("AMP_BRIDGE_LOG_BODIES", "1")
 	t.Setenv("AMP_BIN", "/usr/local/bin/amp")
 	t.Setenv("AMP_BRIDGE_AMP_TIMEOUT", "30s")
@@ -181,6 +212,9 @@ func TestLoadConfigFromEnvironment(t *testing.T) {
 		maxInFlight:     3,
 		maxMessageBytes: 2048,
 		replyWait:       5 * time.Second,
+		maxReplyWait:    20 * time.Second,
+		resultTTL:       30 * time.Minute,
+		maxResults:      12,
 		logBodies:       true,
 		ampBin:          "/usr/local/bin/amp",
 		ampTimeout:      30 * time.Second,
@@ -188,6 +222,28 @@ func TestLoadConfigFromEnvironment(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("loadConfig() = %+v, want %+v", got, want)
+	}
+}
+
+func TestRequestWait(t *testing.T) {
+	t.Parallel()
+	cfg := config{replyWait: 3 * time.Minute, maxReplyWait: 15 * time.Minute}
+	for _, tc := range []struct {
+		name         string
+		milliseconds int64
+		want         time.Duration
+	}{
+		{"default", 0, 3 * time.Minute},
+		{"requested", int64((10 * time.Minute) / time.Millisecond), 10 * time.Minute},
+		{"clamped", int64((20 * time.Minute) / time.Millisecond), 15 * time.Minute},
+		{"overflow safe", int64(^uint64(0) >> 1), 15 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := cfg.requestWait(tc.milliseconds); got != tc.want {
+				t.Errorf("requestWait(%d) = %s, want %s", tc.milliseconds, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -206,9 +262,10 @@ func TestResolveResultString(t *testing.T) {
 	t.Parallel()
 	// The log records this by name; a bare integer is unreadable at 3am.
 	tests := map[resolveResult]string{
-		resolveOK:        "ok",
-		resolveUnknownID: "unknown-id",
-		resolveMissingID: "missing-id",
+		resolveOK:         "ok",
+		resolveStoredLate: "stored-late",
+		resolveUnknownID:  "unknown-id",
+		resolveMissingID:  "missing-id",
 	}
 	for res, want := range tests {
 		if got := res.String(); got != want {

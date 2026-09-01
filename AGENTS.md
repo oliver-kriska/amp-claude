@@ -32,6 +32,7 @@ amp-bridge --list                          # which Claude sessions are reachable
 amp-bridge --ask "your message"            # send + block until Claude answers
 amp-bridge --session <name> --ask "..."    # target a specific session
 amp-bridge --thread <amp-thread-id> --ask "..."   # let Claude reply into your thread
+amp-bridge --timeout 10m --ask "..."        # request a longer server deadline
 ```
 
 `--ask` prints Claude's answer on stdout and exits 0. **Always run `--list`
@@ -72,11 +73,13 @@ the inbox appended the request, but Amp exposes no plugin wake primitive.
 | In-flight requests | 8 | `too many requests in flight` — Claude hasn't answered earlier ones |
 | Async Amp turns | 8 | `too many send_amp requests in flight` — wait for a completion |
 | Message size | 64 KB | `message too large` — send a summary or a file path instead |
-| Reply timeout | 180 s | `timed out waiting for Claude` |
+| Reply timeout | 180 s (15 min max) | timeout returns an id; retrieve a late reply with `--result` |
+| Retained late replies | 1 h / 64 | expiry or bridge restart removes the in-memory result |
 | Amp turn timeout | 120 s | `ask_amp` fails or `send_amp` reports an error completion |
 
 All are env-tunable (`AMP_BRIDGE_MAX_INFLIGHT`, `AMP_BRIDGE_MAX_BYTES`,
-`AMP_BRIDGE_TIMEOUT`, `AMP_BRIDGE_AMP_TIMEOUT`) but the defaults exist to stop a
+`AMP_BRIDGE_TIMEOUT`, `AMP_BRIDGE_MAX_TIMEOUT`, `AMP_BRIDGE_RESULT_TTL`,
+`AMP_BRIDGE_MAX_RESULTS`, `AMP_BRIDGE_AMP_TIMEOUT`) but the defaults exist to stop a
 runaway loop from flooding someone's session. Raise them deliberately, not
 reflexively; `doctor` warns if the Amp timeout leaves 30 s or less before the
 Claude reply deadline.
@@ -93,7 +96,7 @@ at a stale build, where everything reports healthy and nothing is delivered.
 |---|---|
 | `no live amp-bridge sessions` | No Claude session has the channel loaded — it must be started with `claude --dangerously-load-development-channels server:amp-bridge`. Nothing else will work until then. |
 | exit 2, `cannot reach <name> at <path>` | Registry entry exists but the socket is dead; the bridge process died. |
-| exit 1, `timed out waiting for Claude` | Socket fine, event delivered, but Claude never called `reply`. The interesting failure — report it rather than retrying blindly. |
+| exit 1, `timed out waiting for Claude` | Socket fine and event delivered, but no timely `reply`. Use the printed `--result` command; a late answer is retained in memory until expiry unless the bridge restarts. |
 | exit 1, `timed out waiting for Claude` *after* Claude appeared to answer | Claude replied without a `request_id` while several requests were in flight. The bridge refuses to guess and tells Claude so; if Claude does not retry with the id, your call just times out. You never see the guard message itself — it goes to Claude, not to you. |
 | `another CLI fallback turn … is already in flight` | The same idle thread is already running a bridge-started turn. Wait, or enable its inbox when turns need to queue. |
 | exit 137 | The binary was replaced with `cp`, invalidating its macOS code signature. Rebuild, don't work around it. |
@@ -155,8 +158,8 @@ solve Amp-side wake-up for an open idle thread.
 
 ## Building and testing
 
-Toolchain is pinned in `.tool-versions` (mise): Go 1.26.6,
-golangci-lint 2.12.2 and Bun 1.3.5 — Bun only to typecheck the Amp plugin. Run
+Toolchain is pinned in `.tool-versions` (mise): Go 1.27.0,
+golangci-lint 2.13.1 and Bun 1.4.0 — Bun only to typecheck the Amp plugin. Run
 `mise install` once; `make tools` reports the active versions and warns if they
 have drifted from the pins.
 

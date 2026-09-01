@@ -80,9 +80,10 @@ type bridge struct {
 	logMu sync.Mutex
 	logw  io.Writer
 
-	pendMu  sync.Mutex
-	pending map[string]chan string
-	seq     int
+	pendMu   sync.Mutex
+	pending  map[string]chan string
+	retained map[string]retainedReply
+	seq      int
 
 	threadMu   sync.Mutex
 	lastThread string
@@ -198,6 +199,7 @@ func newBridge(cfg config, out, logw io.Writer) *bridge {
 		out:        bufio.NewWriter(out),
 		logw:       logw,
 		pending:    make(map[string]chan string),
+		retained:   make(map[string]retainedReply),
 		asyncSlots: make(chan struct{}, cfg.maxInFlight),
 		cliActive:  make(map[string]struct{}),
 		downCh:     make(chan struct{}),
@@ -423,6 +425,9 @@ func (b *bridge) handleReply(id, args json.RawMessage) {
 	switch res {
 	case resolveOK:
 		b.reply(id, toolResult("delivered to Amp (request_id "+rid+")", false))
+	case resolveStoredLate:
+		b.reply(id, toolResult("the original Amp caller timed out; the reply was retained "+
+			"for retrieval with request_id "+rid, false))
 	case resolveMissingID:
 		b.reply(id, toolResult("request_id is required. The reply was not routed and no one "+
 			"received it. Call reply again, passing the request_id attribute from the "+

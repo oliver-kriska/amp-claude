@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPickBridge(t *testing.T) {
@@ -99,6 +100,52 @@ func TestValueOrDash(t *testing.T) {
 	}
 	if got := valueOrDash("v0.2.0"); got != "v0.2.0" {
 		t.Errorf("valueOrDash(value) = %q", got)
+	}
+}
+
+func TestAdvertisedWait(t *testing.T) {
+	t.Parallel()
+	target := registryEntry{ReplyTimeout: "3m", MaxReplyTimeout: "15m"}
+	for _, tc := range []struct {
+		name      string
+		requested time.Duration
+		want      time.Duration
+	}{
+		{"advertised default", 0, 3 * time.Minute},
+		{"requested", 10 * time.Minute, 10 * time.Minute},
+		{"advertised cap", 20 * time.Minute, 15 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := advertisedWait(target, time.Minute, tc.requested); got != tc.want {
+				t.Errorf("advertisedWait = %s, want %s", got, tc.want)
+			}
+		})
+	}
+	if got := advertisedWait(registryEntry{}, 30*time.Second, 0); got != 3*time.Minute {
+		t.Errorf("legacy advertisedWait = %s, want the fixed legacy 3m deadline", got)
+	}
+}
+
+func TestSupportsRequestedTimeout(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		target registryEntry
+		want   bool
+	}{
+		{"current server", registryEntry{ReplyTimeout: "3m", MaxReplyTimeout: "15m"}, true},
+		{"legacy server", registryEntry{}, false},
+		{"missing maximum", registryEntry{ReplyTimeout: "3m"}, false},
+		{"invalid duration", registryEntry{ReplyTimeout: "later", MaxReplyTimeout: "15m"}, false},
+		{"maximum below default", registryEntry{ReplyTimeout: "15m", MaxReplyTimeout: "3m"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := supportsRequestedTimeout(tc.target); got != tc.want {
+				t.Errorf("supportsRequestedTimeout(%+v) = %v, want %v", tc.target, got, tc.want)
+			}
+		})
 	}
 }
 

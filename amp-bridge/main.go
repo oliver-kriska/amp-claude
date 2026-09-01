@@ -41,6 +41,7 @@ const (
 	modeServe runMode = iota
 	modeList
 	modeAsk
+	modeResult
 	modeHelp
 	modeVersion
 	modeDoctor
@@ -48,14 +49,16 @@ const (
 )
 
 type options struct {
-	mode    runMode
-	session string
-	thread  string
-	text    string
-	dir     string
-	strict  bool
-	verbose bool
-	global  bool
+	mode      runMode
+	session   string
+	thread    string
+	text      string
+	requestID string
+	timeout   time.Duration
+	dir       string
+	strict    bool
+	verbose   bool
+	global    bool
 	// ampPlugin installs the Amp-side half; force overwrites a divergent copy.
 	ampPlugin bool
 	force     bool
@@ -74,12 +77,16 @@ const usage = `amp-bridge — bridge an Amp thread to a Claude Code session
   amp-bridge doctor [dir] [--strict]    diagnose why the channel is not working
   amp-bridge --list [--verbose]         list live bridges; include build and handshake details
   amp-bridge --version                  print the version and build fingerprint
-  amp-bridge [--session N] [--thread T] --ask "text"
+  amp-bridge [--session N] [--thread T] [--timeout D] --ask "text"
+  amp-bridge [--session N] --result REQUEST_ID
 
 Environment:
   AMP_BRIDGE_MAX_INFLIGHT   inbound and async caps           (default 8 each)
   AMP_BRIDGE_MAX_BYTES      max bytes per message            (default 65536)
   AMP_BRIDGE_TIMEOUT        how long a caller waits          (default 3m0s)
+  AMP_BRIDGE_MAX_TIMEOUT    longest per-request --timeout    (default 15m0s)
+  AMP_BRIDGE_RESULT_TTL     retain replies after timeout     (default 1h0m0s)
+  AMP_BRIDGE_MAX_RESULTS    retained late-reply cap          (default 64)
   AMP_BRIDGE_AMP_TIMEOUT    how long ask_amp/send_amp waits  (default 2m0s)
   AMP_BRIDGE_LOG            log file (default ~/.local/state/amp-bridge/amp-bridge.log)
   AMP_BRIDGE_LOG_BODIES     1 to log frame bodies (contains conversation text)
@@ -98,47 +105,95 @@ func parseArgs(args []string) (options, error) {
 		return sub, subcommandError(args)
 	}
 
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--list":
-			o.mode = modeList
-		case "--verbose":
-			o.verbose = true
-		case "--help", "-h":
-			o.mode = modeHelp
-			return o, nil
-		case "--version":
-			o.mode = modeVersion
-			return o, nil
-		case "--session", "--thread":
-			if i+1 >= len(args) {
-				return o, fmt.Errorf("%s needs a value", args[i])
-			}
-			if args[i] == "--session" {
-				o.session = args[i+1]
-			} else {
-				o.thread = args[i+1]
-			}
-			i++
-		case "--ask":
-			if o.verbose {
-				return o, errors.New("--verbose is only valid with --list")
-			}
-			// Everything after --ask is the message, so it need not be quoted.
-			o.mode = modeAsk
-			o.text = strings.TrimSpace(strings.Join(args[i+1:], " "))
-			if o.text == "" {
-				return o, errors.New("--ask needs a message")
-			}
-			return o, nil
-		default:
-			return o, fmt.Errorf("unknown argument %q (try --help)", args[i])
+	for i := 0; i < len(args); {
+		done, err := parseFlag(&o, args, &i)
+		if err != nil {
+			return o, err
 		}
+		if done {
+			return o, nil
+		}
+		i++
 	}
 	if o.verbose && o.mode != modeList {
 		return o, errors.New("--verbose is only valid with --list")
 	}
+	if o.timeout != 0 && o.mode != modeAsk {
+		return o, errors.New("--timeout is only valid with --ask")
+	}
+	if o.mode == modeResult && o.thread != "" {
+		return o, errors.New("--thread is not valid with --result")
+	}
 	return o, nil
+}
+
+func parseFlag(o *options, args []string, i *int) (bool, error) {
+	flag := args[*i]
+	switch flag {
+	case "--list":
+		if o.mode != modeServe && o.mode != modeList {
+			return false, errors.New("--list cannot be combined with another command")
+		}
+		o.mode = modeList
+	case "--verbose":
+		o.verbose = true
+	case "--help", "-h":
+		o.mode = modeHelp
+		return true, nil
+	case "--version":
+		o.mode = modeVersion
+		return true, nil
+	case "--session", "--thread", "--timeout", "--result":
+		if *i+1 >= len(args) {
+			return false, fmt.Errorf("%s needs a value", flag)
+		}
+		if err := parseValueArg(o, flag, args[*i+1]); err != nil {
+			return false, err
+		}
+		*i++
+	case "--ask":
+		if o.verbose {
+			return false, errors.New("--verbose is only valid with --list")
+		}
+		if o.mode != modeServe {
+			return false, errors.New("--ask cannot be combined with another command")
+		}
+		// Everything after --ask is the message, so it need not be quoted.
+		o.mode = modeAsk
+		o.text = strings.TrimSpace(strings.Join(args[*i+1:], " "))
+		if o.text == "" {
+			return false, errors.New("--ask needs a message")
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("unknown argument %q (try --help)", flag)
+	}
+	return false, nil
+}
+
+func parseValueArg(o *options, flag, value string) error {
+	switch flag {
+	case "--session":
+		o.session = value
+	case "--thread":
+		o.thread = value
+	case "--timeout":
+		wait, err := time.ParseDuration(value)
+		if err != nil || wait < time.Millisecond {
+			return fmt.Errorf("--timeout needs a duration of at least 1ms; got %q", value)
+		}
+		o.timeout = wait
+	case "--result":
+		if o.mode != modeServe {
+			return errors.New("--result cannot be combined with another command")
+		}
+		if strings.TrimSpace(value) == "" {
+			return errors.New("--result needs a non-empty request id")
+		}
+		o.mode = modeResult
+		o.requestID = value
+	}
+	return nil
 }
 
 // parseSubcommand recognises the verb form (`init`, `doctor`), which takes an
@@ -239,7 +294,9 @@ func run(args []string) int {
 			)
 			return 2
 		}
-		return cmdAsk(cfg, opts.session, opts.thread, opts.text)
+		return cmdAsk(cfg, opts.session, opts.thread, opts.text, opts.timeout)
+	case modeResult:
+		return cmdResult(cfg, opts.session, opts.requestID)
 	case modeInit:
 		// --amp-plugin names the artefact, --global names the scope, so the
 		// artefact is selected first. Checking global first meant that
@@ -315,6 +372,8 @@ func runServer(cfg config) int {
 	b := newBridge(cfg, os.Stdout, lf)
 
 	name, sock, entry := resolveIdentity()
+	entry.ReplyTimeout = cfg.replyWait.String()
+	entry.MaxReplyTimeout = cfg.maxReplyWait.String()
 	if _, err := ensureRuntimeDir(); err != nil {
 		b.logf("RUNTIME_DIR_FAILED %v", err)
 		fmt.Fprintf(os.Stderr, "amp-bridge: %v\n", err)

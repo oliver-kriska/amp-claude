@@ -19,6 +19,14 @@ type config struct {
 	maxMessageBytes int
 	// replyWait is how long an Amp caller blocks waiting for Claude.
 	replyWait time.Duration
+	// maxReplyWait caps a timeout requested by an individual Amp caller. The
+	// default remains short, while deep consultations can opt into a longer
+	// bounded wait without restarting the Claude session.
+	maxReplyWait time.Duration
+	// resultTTL and maxResults bound the in-memory mailbox for replies that
+	// arrive after their original caller timed out.
+	resultTTL  time.Duration
+	maxResults int
 	// logBodies logs whole frames rather than frame shape. Off by default:
 	// bodies carry conversation content.
 	logBodies bool
@@ -32,15 +40,33 @@ type config struct {
 }
 
 func loadConfig() config {
+	replyWait := envDuration("AMP_BRIDGE_TIMEOUT", 180*time.Second)
+	maxReplyWait := envDuration("AMP_BRIDGE_MAX_TIMEOUT", 15*time.Minute)
+	maxReplyWait = max(maxReplyWait, replyWait)
+
 	return config{
 		maxInFlight:     envInt("AMP_BRIDGE_MAX_INFLIGHT", 8),
 		maxMessageBytes: envInt("AMP_BRIDGE_MAX_BYTES", 64*1024),
-		replyWait:       envDuration("AMP_BRIDGE_TIMEOUT", 180*time.Second),
+		replyWait:       replyWait,
+		maxReplyWait:    maxReplyWait,
+		resultTTL:       envDuration("AMP_BRIDGE_RESULT_TTL", time.Hour),
+		maxResults:      envInt("AMP_BRIDGE_MAX_RESULTS", 64),
 		logBodies:       os.Getenv("AMP_BRIDGE_LOG_BODIES") == "1",
 		ampBin:          envStr("AMP_BIN", "amp"),
 		ampTimeout:      envDuration("AMP_BRIDGE_AMP_TIMEOUT", 120*time.Second),
 		ampDisabled:     os.Getenv("AMP_BRIDGE_DISABLE_OUTBOUND") == "1",
 	}
+}
+
+func (c config) requestWait(milliseconds int64) time.Duration {
+	if milliseconds <= 0 {
+		return c.replyWait
+	}
+	maxMillis := c.maxReplyWait.Milliseconds()
+	if milliseconds >= maxMillis {
+		return c.maxReplyWait
+	}
+	return time.Duration(milliseconds) * time.Millisecond
 }
 
 // envInt reads a positive integer. Zero, negative and unparseable values fall

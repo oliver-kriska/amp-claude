@@ -16,6 +16,7 @@ Always identify both endpoints before asking:
 amp-bridge --list
 amp-bridge --session <claude-session> \
   --thread <this-amp-thread-id> \
+  --timeout 10m \
   --ask "<self-contained question>"
 ```
 
@@ -26,9 +27,21 @@ knows which Amp thread called it. Without this field the channel event has no
 back to a managed/background thread.
 
 Run `--list` first and omit `--session` only when exactly one session is live.
-`--ask` blocks for Claude's correlated `reply`, then prints it. If Claude says
-the work needs longer than the reply window, split it into a short question or
-ask Claude to acknowledge first.
+`--ask` blocks for Claude's correlated `reply`, then prints it. The default is
+3 minutes. Use `--timeout <duration>` for a longer consultation; the live server
+clamps it to its advertised maximum (15 minutes by default), so unlike setting
+`AMP_BRIDGE_TIMEOUT` only on the client process, it changes the actual server
+deadline. `--list --verbose` shows both values.
+If the selected live session predates this protocol and advertises neither
+limit, `--timeout` refuses before delivery and asks you to restart that Claude
+session; this prevents the client deadline from racing a legacy server.
+
+If a request still times out, the error prints its `request_id` and an exact
+`amp-bridge --session <name> --result <request_id>` command. A late `reply` is
+kept in a bounded, memory-only mailbox (1 hour and 64 results by default). Run
+the printed command after Claude finishes. If it reports that the id expired or
+the bridge restarted, the answer is unrecoverable; do not assume a retry is safe
+without checking the session first.
 
 If the current message itself says that Claude asks via amp-bridge, answer the
 request normally in this Amp turn. The inbox plugin captures your final answer.
@@ -54,7 +67,7 @@ Every word meant for Amp must go through `reply`, `ask_amp` or `send_amp`.
 Events arrive as:
 
 ```
-<channel source="amp-bridge" request_id="amp-1787127436157248000-2" thread_id="T-abc123">
+<channel source="amp-bridge" request_id="amp-1787127436157248000-2" thread_id="T-abc123" timeout_ms="180000">
   ...Amp's message...
 </channel>
 ```
@@ -76,9 +89,14 @@ gets the wrong answer or hangs until timeout. If more than one request is open
 and you omit it, the bridge refuses the reply and tells you so; re-send with the
 id rather than guessing.
 
-Amp's caller is **blocked** while you think, with a default 180 s timeout. For
-long work, reply promptly with an acknowledgement and current status rather than
-staying silent until you finish.
+Amp's caller is **blocked** while you think. The `timeout_ms` attribute is the
+effective deadline for that request. For long work, either finish within it or
+reply promptly with an acknowledgement and current status. A reply that lands
+after the deadline is retained for explicit retrieval only when the caller's own
+timer fired; a caller that disconnected first leaves no slot behind, and you are
+told the reply was dropped. Retention lasts only as long as this bridge process,
+and a retained reply is truncated to the 64 KB message cap even though a timely
+one is not — so answering late can silently cost you the tail of a long answer.
 
 ### Asking Amp — `ask_amp`
 
@@ -99,8 +117,11 @@ explanation — that's expected, not a bug.
 
 **Tell Amp not to call `amp-bridge --ask` in the turn you triggered.** While
 `ask_amp` is in flight your session is inside a tool call and cannot take a turn
-to answer an inbound channel event, so Amp's `--ask` would sit there until it
-timed out at 180 s. `amp-bridge --list` is safe — it only reads the registry.
+to answer an inbound channel event, so Amp's `--ask` would sit there for its
+whole deadline — three minutes by default, and as long as the advertised maximum
+of fifteen if that caller passed `--timeout`. This is no longer a fixed 180 s
+wait, so the cost of getting it wrong scales with what Amp asked for.
+`amp-bridge --list` is safe — it only reads the registry.
 Say so explicitly in the message; Amp has no way to know your session is blocked.
 
 **A thread open in an interactive Amp session is reachable only if its inbox is
@@ -194,7 +215,9 @@ nothing is delivered. `amp-bridge init` repairs that one.
 | Symptom | Cause |
 |---|---|
 | Amp: `no live amp-bridge sessions` | No Claude session has the channel loaded. Needs `claude --dangerously-load-development-channels server:amp-bridge`. |
-| Amp: `timed out waiting for Claude` | The event was delivered but no `reply` call followed. Usually the id was wrong, or the turn ended without replying. |
+| Amp: `timed out waiting for Claude` | The event was delivered but no timely `reply` followed. Use the printed `--result` command; a late reply is retained in memory until its stated expiry unless the bridge restarts. |
+| Amp: `--result` says the id expired or the bridge restarted | The bounded mailbox no longer has that request. Check the Claude transcript before deciding whether one resend is safe. |
+| Amp: `predates per-request timeouts` | That live session runs an older bridge build advertising no timeout limits, so `--timeout` refuses before delivering rather than let the client deadline race the server's. Restart that Claude session on the current binary, or ask without `--timeout`. |
 | Amp: `too many requests in flight` | 8 unanswered events already queued. Answer them; the cap is deliberate flood protection. |
 | Amp: `message too large` | Over 64 KB. Ask Amp to send a summary or a file path. |
 | Events stop arriving entirely | The bridge process died, or the session was started without the channel flag. Check `~/.local/state/amp-bridge/amp-bridge.log`. |
@@ -226,7 +249,11 @@ Three things look like bugs and are load-bearing. Read
 
 Rebuild with `make setup` (from the repo root) — plain `make build` does not
 update what the channel launches, since `.mcp.json` points at the installed
-binary. Then `make check` — that runs formatting, `go vet`, 29 linters,
+binary. If you changed this document, `make setup` is not enough either: it
+registers the project scope, while the copy at `~/.claude/skills/amp-bridge/`
+is written only by `init --global`, so use `make setup-global`. `doctor` reports
+the gap as a stale `claude skill`. Then `make check` — that runs formatting,
+`go vet`, 29 linters,
 `govulncheck`, `tsc` over the Amp plugin, both drift gates (the embedded skill and
 the embedded plugin), and both test tiers under the race detector.
 `make test` alone is the fast unit pass; `make test-integration` spawns a real

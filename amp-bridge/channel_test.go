@@ -228,6 +228,30 @@ func TestResolveIsOneShot(t *testing.T) {
 	}
 }
 
+func TestResolveLateReplyIsOneShot(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(c *config) { c.maxMessageBytes = 20 })
+	id, _, err := h.b.pushEvent("q", "")
+	if err != nil {
+		t.Fatalf("pushEvent: %v", err)
+	}
+	if _, ok := h.b.expire(id); !ok {
+		t.Fatal("expire = false")
+	}
+
+	first := strings.Repeat("first", 10)
+	if got, _ := h.b.resolve(id, first); got != resolveStoredLate {
+		t.Fatalf("first late resolve should be stored, got %v", got)
+	}
+	if got, _ := h.b.resolve(id, "second"); got != resolveUnknownID {
+		t.Errorf("a second late reply must be refused, got %v", got)
+	}
+	state, retained := h.b.retainedResult(id)
+	if state != retainedReady || retained.text != truncateMessage(first, 20) {
+		t.Errorf("retained result = (%v, %q), want bounded first reply", state, retained.text)
+	}
+}
+
 func TestResolveConcurrent(t *testing.T) {
 	t.Parallel()
 	const n = 24
@@ -322,6 +346,27 @@ func TestReplyToolOutcomes(t *testing.T) {
 		h.call(t, replyCall("r", "x", "amp-nope"))
 		if !isToolError(t, result(t, h.response(t, "r"))) {
 			t.Error("an unknown request_id must be reported as an error")
+		}
+	})
+
+	t.Run("stores a late reply", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		id, _, err := h.b.pushEvent("q", "")
+		if err != nil {
+			t.Fatalf("pushEvent: %v", err)
+		}
+		if _, ok := h.b.expire(id); !ok {
+			t.Fatal("expire = false")
+		}
+		h.call(t, replyCall("r", "late", id))
+
+		res := result(t, h.response(t, "r"))
+		if isToolError(t, res) {
+			t.Errorf("a retained late reply should be accepted: %v", res)
+		}
+		if !strings.Contains(toolText(t, res), "retained") {
+			t.Errorf("Claude should be told the late reply was retained: %q", toolText(t, res))
 		}
 	})
 }
@@ -540,7 +585,10 @@ func TestCallerDisconnectFreesTheSlot(t *testing.T) {
 
 func TestReplyTimeoutReleasesTheSlot(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t, func(c *config) { c.replyWait = 100 * time.Millisecond })
+	h := newHarness(t, func(c *config) {
+		c.replyWait = 100 * time.Millisecond
+		c.resultTTL = time.Minute
+	})
 	conn := dialBridge(t, serveOnTempSocket(t, h))
 
 	if err := json.NewEncoder(conn).Encode(ampRequest{Text: "nobody will answer"}); err != nil {
@@ -554,7 +602,98 @@ func TestReplyTimeoutReleasesTheSlot(t *testing.T) {
 	if !strings.Contains(resp.Error, "timed out") {
 		t.Errorf("error = %q, want a timeout", resp.Error)
 	}
+	if resp.RequestID == "" {
+		t.Fatal("a timeout must return its request id for late-result retrieval")
+	}
 	waitFor(t, "the timed-out slot to be released", func() bool { return h.b.pendingCount() == 0 })
+
+	if outcome, _ := h.b.resolve(resp.RequestID, "late answer"); outcome != resolveStoredLate {
+		t.Fatalf("late resolve = %s, want stored-late", outcome)
+	}
+	if err := json.NewEncoder(conn).Encode(ampRequest{ResultID: resp.RequestID}); err != nil {
+		t.Fatalf("request retained result: %v", err)
+	}
+	var retained ampResponse
+	if err := json.NewDecoder(conn).Decode(&retained); err != nil {
+		t.Fatalf("decode retained result: %v", err)
+	}
+	if retained.Reply != "late answer" {
+		t.Errorf("retained reply = %q, want late answer", retained.Reply)
+	}
+}
+
+func TestPerRequestTimeoutExtendsTheDefaultAndIsCapped(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(c *config) {
+		c.replyWait = 20 * time.Millisecond
+		c.maxReplyWait = 500 * time.Millisecond
+	})
+	sock := serveOnTempSocket(t, h)
+
+	extended := dialBridge(t, sock)
+	if err := json.NewEncoder(extended).Encode(ampRequest{
+		Text:          "take longer",
+		TimeoutMillis: 500,
+	}); err != nil {
+		t.Fatalf("send extended request: %v", err)
+	}
+	waitFor(t, "the extended request", func() bool { return len(h.notifications(t)) == 1 })
+	time.Sleep(50 * time.Millisecond)
+	params, _ := h.notifications(t)[0]["params"].(map[string]any)
+	meta, _ := params["meta"].(map[string]any)
+	id, _ := meta["request_id"].(string)
+	if got := meta["timeout_ms"]; got != "500" {
+		t.Errorf("timeout_ms = %v, want 500", got)
+	}
+	if outcome, _ := h.b.resolve(id, "done"); outcome != resolveOK {
+		t.Fatalf("resolve extended request = %s", outcome)
+	}
+	var extendedResp ampResponse
+	if err := json.NewDecoder(extended).Decode(&extendedResp); err != nil {
+		t.Fatalf("decode extended response: %v", err)
+	}
+	if extendedResp.Reply != "done" {
+		t.Errorf("extended reply = %q, want done", extendedResp.Reply)
+	}
+
+	capped := dialBridge(t, sock)
+	if err := json.NewEncoder(capped).Encode(ampRequest{
+		Text:          "cap me",
+		TimeoutMillis: int64((5 * time.Second) / time.Millisecond),
+	}); err != nil {
+		t.Fatalf("send capped request: %v", err)
+	}
+	var cappedResp ampResponse
+	if err := json.NewDecoder(capped).Decode(&cappedResp); err != nil {
+		t.Fatalf("decode capped response: %v", err)
+	}
+	if !strings.Contains(cappedResp.Error, "timed out") {
+		t.Errorf("capped error = %q, want timeout", cappedResp.Error)
+	}
+}
+
+func TestRetainedRepliesExpireAndStayBounded(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(c *config) {
+		c.resultTTL = 20 * time.Millisecond
+		c.maxResults = 2
+	})
+
+	for _, id := range []string{"first", "second", "third"} {
+		h.b.pendMu.Lock()
+		h.b.pending[id] = make(chan string, 1)
+		h.b.pendMu.Unlock()
+		if _, ok := h.b.expire(id); !ok {
+			t.Fatalf("expire(%s) = false", id)
+		}
+	}
+	if state, _ := h.b.retainedResult("first"); state != retainedMissing {
+		t.Errorf("oldest retained state = %d, want missing after cap eviction", state)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if state, _ := h.b.retainedResult("third"); state != retainedMissing {
+		t.Errorf("expired retained state = %d, want missing", state)
+	}
 }
 
 func TestConcurrentCallersDoNotCrossTalk(t *testing.T) {

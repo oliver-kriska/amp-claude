@@ -51,6 +51,10 @@ type registryEntry struct {
 	// string before and after, while the inode behind it has changed.
 	Version     string `json:"version,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"`
+	// ReplyTimeout is the default Amp->Claude wait. MaxReplyTimeout is the
+	// longest per-request --timeout this running process will accept.
+	ReplyTimeout    string `json:"reply_timeout,omitempty"`
+	MaxReplyTimeout string `json:"max_reply_timeout,omitempty"`
 	// InitializedAt is set once Claude completes the MCP handshake. Without it
 	// the only evidence of a working channel is a marker somewhere in an
 	// append-only log, which proves something happened once, not that this

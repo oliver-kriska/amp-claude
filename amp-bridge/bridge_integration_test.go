@@ -590,7 +590,9 @@ func TestProcessClientListAndAsk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--list --verbose failed: %v: %s", err, verboseOut)
 	}
-	for _, want := range []string{"bridge_pid=", "version=", "build=", "handshake=", "socket="} {
+	for _, want := range []string{
+		"bridge_pid=", "version=", "build=", "handshake=", "timeout=", "max_timeout=", "socket=",
+	} {
 		if !strings.Contains(string(verboseOut), want) {
 			t.Errorf("verbose list omitted %q: %s", want, verboseOut)
 		}
