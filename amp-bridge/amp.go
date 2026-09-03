@@ -202,6 +202,14 @@ func (b *bridge) deliverToAmp(
 	if out == "" && errOut != "" {
 		return errOut, nil
 	}
+	// A clean exit is not evidence that a turn produced anything. Returning ""
+	// with a nil error tells the caller Amp answered and had nothing to say,
+	// which is a claim we cannot support: an exit code says the process ended,
+	// not that the agent spoke. Judged after the stderr fallback, so this fires
+	// only when there was genuinely no output on either stream.
+	if strings.TrimSpace(out) == "" {
+		return "", errEmptyAnswer("amp exited cleanly but", threadID)
+	}
 	return out, nil
 }
 

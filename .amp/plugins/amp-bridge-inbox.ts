@@ -545,6 +545,21 @@ export default function (amp: PluginAPI) {
       }
 
       const reply = texts.join('\n').split(req.marker).join('').trim()
+      if (reply === '') {
+        // The check above is not enough: a text block that is empty, whitespace,
+        // or nothing but our own marker passes `texts.length > 0` and only
+        // becomes empty here, after joining, marker removal and trimming. It
+        // then went back as a successful zero-byte answer, which reads to the
+        // caller as "Amp considered it and had nothing to say" — indistinguishable
+        // from a turn that never really produced one. Blank has to be judged on
+        // what we would actually send, not on what we extracted.
+        log(`END_EMPTY_REPLY req=${req.id} texts=${texts.length}`)
+        respond(req, {
+          error: 'the Amp turn finished but its answer was empty after normalization',
+          code: 'empty-answer',
+        })
+        return
+      }
       log(`RESPONDED req=${req.id} bytes=${Buffer.byteLength(reply)}`)
       respond(req, { reply })
     } catch (err) {

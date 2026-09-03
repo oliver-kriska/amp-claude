@@ -309,3 +309,42 @@ test('log lines name the pid, since every Amp session shares one file', async ()
   expect(logged).toContain(`[${process.pid}]`)
   await p.dispose()
 })
+
+// The `texts.length === 0` guard runs before normalization, so a text block that
+// is empty or whitespace slips past it and only becomes blank after joining and
+// trimming. It then went back as a successful zero-byte reply, which reads as
+// "Amp had nothing to add" — a claim the plugin is in no position to make.
+//
+// Not covered here: an answer consisting only of the request marker. Stripping
+// removes the id but leaves its brackets, so that normalizes to "[]" and stays a
+// (strange) non-empty answer. Widening the strip is a separate decision about
+// marker syntax, not part of the blank check.
+test.each([
+  ['an empty text block', ''],
+  ['whitespace only', '   \n\t  '],
+])('a blank answer is reported, not returned as success: %s', async (_name, text) => {
+  const p = await loadPlugin()
+  await p.enable()
+  p.setState('idle')
+
+  const pending = ask(4000)
+  await Bun.sleep(120)
+
+  const marker = /\[(amp-bridge-req-[0-9a-f]{12})\]/.exec(p.appendCalls[0].content)
+  expect(marker).not.toBeNull()
+
+  p.fire('agent.start', { thread: { id: THREAD }, message: `... ${marker![1]} ...`, id: 'M-1' })
+  p.fire('agent.end', {
+    thread: { id: THREAD },
+    id: 'M-1',
+    status: 'done',
+    message: '',
+    messages: [{ role: 'assistant', id: 'M-1', content: [{ type: 'text', text }] }],
+  })
+
+  const reply = await pending
+  expect(reply.reply).toBeUndefined()
+  expect(reply.code).toBe('empty-answer')
+  expect(reply.error).toContain('empty')
+  await p.dispose()
+})

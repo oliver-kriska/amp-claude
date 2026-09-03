@@ -418,6 +418,9 @@ func TestInboxErrorCodesAreActionable(t *testing.T) {
 		// message must steer the caller away from resending it.
 		{"no-turn", "do not resend"},
 		{"append-failed", "could not append"},
+		// The turn ran and said nothing. The caller needs to know that a verbatim
+		// resend is likely to earn the same silence.
+		{"empty-answer", "produced no answer"},
 	} {
 		t.Run(tc.code, func(t *testing.T) {
 			p := newFakePlugin(t, "T-open")
@@ -771,6 +774,47 @@ func TestDeliveredSendReportsPendingNotFailure(t *testing.T) {
 			// The slot has to come back regardless of how the turn ended, or a
 			// run of these exhausts the cap and blocks every later send.
 			waitFor(t, "the async slot to be released", func() bool { return len(h.b.asyncSlots) == 0 })
+		})
+	}
+}
+
+// A turn that ends without saying anything must not come back as a successful
+// empty answer. The distinction matters because the two readings point opposite
+// ways: "Amp considered it and had nothing to add" invites the caller to move
+// on, while "the turn produced nothing usable" is a reason to look at the thread.
+func TestEmptyAnswerIsNotASuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply inboxReply
+	}{
+		// What a plugin new enough to notice sends.
+		{"reported by the plugin", inboxReply{Error: "empty after normalization", Code: "empty-answer"}},
+		// What every plugin already loaded in a running Amp session sends, since
+		// picking up the check needs a manual reload. The newer end has to hold
+		// the invariant on its own.
+		{"stale plugin sends a blank reply", inboxReply{Reply: ""}},
+		{"stale plugin sends only whitespace", inboxReply{Reply: "  \n\t "}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newFakePlugin(t, "T-open")
+			p.reply = tc.reply
+			h := inboxHarness(t, p, "T-open")
+
+			out, err := h.b.askAmp("T-open", "hello")
+			if err == nil {
+				t.Fatalf("an empty answer must be an error, got out=%q", out)
+			}
+			if !strings.Contains(err.Error(), "produced no answer") {
+				t.Errorf("error = %q, want it to say no answer was produced", err)
+			}
+			// Delivered and terminal: never "safe to retry", never "still running".
+			if got := classifyDelivery(err); got != deliveryFailed {
+				t.Errorf("delivery = %s, want turn-failed", got)
+			}
+			// Resending the same text is the one move that cannot help.
+			if !strings.Contains(err.Error(), "rephrase") {
+				t.Errorf("error = %q, want it to steer away from a verbatim resend", err)
+			}
 		})
 	}
 }

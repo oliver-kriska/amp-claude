@@ -124,6 +124,12 @@ to resend; resending duplicates it. Read the wording before deciding: "safe to
 retry" means nothing was appended, "do not resend" means it is already there,
 and "check the thread" means the bridge could not tell.
 
+**An empty answer comes back as an error, not as a blank success.** A turn that
+finishes without producing any text fails with "produced no answer". It ran, so
+the fix is never a verbatim resend — read the thread, then rephrase or supply
+the context Amp was missing. If Amp genuinely has nothing to add it says so in
+words, which is a normal successful reply.
+
 **Tell Amp not to call `amp-bridge --ask` in the turn you triggered.** While
 `ask_amp` is in flight your session is inside a tool call and cannot take a turn
 to answer an inbound channel event, so Amp's `--ask` would sit there for its
@@ -237,6 +243,7 @@ nothing is delivered. `amp-bridge init` repairs that one.
 | Exit code 137 running the binary | It was replaced with `cp`, invalidating its macOS signature. Rebuild with `rm -f amp-bridge && go build -o amp-bridge .`. |
 | `ask_amp`: `has not enabled its Claude inbox` | The thread has not opted in. In that thread use `Enable Claude inbox for this thread`; for a managed thread, use `Enable Claude inbox for another thread` from a local controller and paste its URL/id. |
 | `ask_amp`: `already has requests queued` | That thread's inbox is enabled but Amp has not finished earlier turns. Wait; don't retry straight away. |
+| `ask_amp`/`send_amp`: `produced no answer` | The turn ran to completion and emitted no text. Resending the same words is the one move that cannot help — read the thread, then rephrase or add the missing context. |
 | `ask_amp`: `was disabled or the plugin reloaded while the request was in flight` | Delivery is genuinely unknown. Say so, and have the thread checked before anything is resent. |
 | `ask_amp`: `did not start a turn for it` | Your question IS queued in the thread. Do not resend — that duplicates it. Ask your user to continue in that thread; the next activity may pick it up. |
 | `send_amp`: `too many send_amp requests in flight` | The background cap is full. Wait for a completion event before starting another. Slots are held for the length of Amp's turn, so a long review holds one for minutes. |

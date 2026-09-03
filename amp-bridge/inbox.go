@@ -137,6 +137,17 @@ func deliveryFault(state deliveryState, format string, a ...any) error {
 	return &deliveryError{state: state, err: fmt.Errorf(format, a...)}
 }
 
+// errEmptyAnswer is the one verdict for a turn that ended without saying
+// anything, wherever we notice it: the CLI path, the plugin's own report, and
+// the guard against a plugin too old to make that report. One wording, because
+// the caller's next move is identical in all three — and it is never "resend".
+func errEmptyAnswer(how, threadID string) error {
+	return deliveryFault(deliveryFailed,
+		"%s produced no answer for thread %s. The turn ran, so resending the same text "+
+			"may well produce the same silence — read the thread, then rephrase or add "+
+			"the context it was missing", how, threadID)
+}
+
 // classifyDelivery reads the state out of an error, defaulting to unknown.
 // Unknown is the safe default: every path that has not proven the message
 // stayed out of the thread must not invite a resend.
@@ -389,6 +400,15 @@ func (b *bridge) askViaInbox(e inboxEntry, threadID, text string, budget time.Du
 		b.logf("INBOX_FAILED thread=%s req=%s code=%s delivery=%s", threadID, id, r.Code, state)
 		return "", inboxCodeError(r, threadID, state)
 	}
+	if strings.TrimSpace(r.Reply) == "" {
+		// The plugin above this version reports its own `empty-answer`, so this
+		// only fires against one that predates the check — which is every plugin
+		// already loaded in a running Amp session, since a reload is manual. The
+		// same reasoning as the `delivered` field: the newer end enforces the
+		// invariant rather than assuming both sides upgraded together.
+		b.logf("INBOX_EMPTY thread=%s req=%s", threadID, id)
+		return "", errEmptyAnswer("the Amp turn finished but", threadID)
+	}
 	b.logf("INBOX_OK thread=%s req=%s bytes=%d", threadID, id, len(r.Reply))
 	return r.Reply, nil
 }
@@ -406,7 +426,12 @@ func inboxDeliveryState(r inboxReply) deliveryState {
 		return deliveryNotSent
 	case "no-turn":
 		return deliveryPending
-	case "turn-error", "turn-cancelled":
+	case "turn-error", "turn-cancelled", "empty-answer":
+		// empty-answer is delivered and terminal: the turn ran to completion and
+		// produced nothing usable. Not pending — nothing more is coming — and not
+		// retryable on its own, because the same question may well produce the
+		// same silence. Resending is the caller's judgement call, which is
+		// exactly what deliveryFailed means.
 		return deliveryFailed
 	case "timeout":
 		if r.Delivered == nil {
@@ -451,6 +476,12 @@ func inboxCodeError(r inboxReply, threadID string, state deliveryState) error {
 	case "turn-error", "turn-cancelled":
 		return deliveryFault(state, "the Amp turn %s before answering — check thread %s",
 			strings.TrimPrefix(r.Code, "turn-"), threadID)
+	case "empty-answer":
+		// Deliberately not a success with empty text. A zero-byte answer reads as
+		// "Amp had nothing to add" when the likelier causes are a turn that
+		// produced only tool calls or a question Amp could not act on — and the
+		// caller cannot tell those apart from silence.
+		return errEmptyAnswer("the Amp turn finished but", threadID)
 	case "timeout":
 		// The distinction the caller actually needs. "Delivered and running" and
 		// "never left the queue" are both timeouts and want opposite responses,

@@ -479,3 +479,37 @@ func TestAskAmpLogsTheResolvedThread(t *testing.T) {
 		t.Error(`log still records the unresolved thread="" form`)
 	}
 }
+
+// The CLI half of the same rule. `amp` exiting 0 says the process ended, not
+// that the agent spoke; returning "" with a nil error would claim the second.
+func TestCLIExitZeroWithNoOutputIsNotAnAnswer(t *testing.T) {
+	t.Parallel()
+	h := ampHarness(t, `exit 0`)
+
+	out, err := h.b.askAmp("T-1", "hi")
+	if err == nil {
+		t.Fatalf("a silent clean exit must not read as an answer, got out=%q", out)
+	}
+	if !strings.Contains(err.Error(), "produced no answer") {
+		t.Errorf("error = %q, want it to say no answer was produced", err)
+	}
+	if got := classifyDelivery(err); got != deliveryFailed {
+		t.Errorf("delivery = %s, want turn-failed", got)
+	}
+}
+
+// The guard is judged on what we would actually return, so it must not fire when
+// the stderr fallback found something. That fallback exists precisely because
+// some Amp builds leave stdout empty on a successful turn.
+func TestStderrOnlyOutputStillCountsAsAnAnswer(t *testing.T) {
+	t.Parallel()
+	h := ampHarness(t, `echo "the real answer" >&2; exit 0`)
+
+	out, err := h.b.askAmp("T-1", "hi")
+	if err != nil {
+		t.Fatalf("askAmp: %v", err)
+	}
+	if !strings.Contains(out, "the real answer") {
+		t.Errorf("out = %q, want the stderr text", out)
+	}
+}
