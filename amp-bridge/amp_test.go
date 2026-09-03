@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// spawnWait bounds the tests that wait on the fake Amp CLI actually running.
+// They assert on routing, not on how fast this machine can fork; a budget sized
+// for in-process work makes them fail whenever something else is busy.
+const spawnWait = 30 * time.Second
+
 // fakeAmp writes a stand-in for the Amp CLI and returns its path. The bridge
 // invokes `<bin> [--log-file <path>] threads continue <id> --execute <text>`, so
 // the script can assert on its own arguments.
@@ -214,7 +219,7 @@ func TestSendAmpUsesTheCLIFallbackWithoutRebinding(t *testing.T) {
 	// The synchronous CLI mutex is deliberately held for this whole assertion.
 	// Background work has its own bounded slots and must not queue ahead of a
 	// later foreground ask whose caller has a shorter deadline.
-	waitFor(t, "the CLI async completion event", func() bool { return len(h.notifications(t)) == 1 })
+	waitUpTo(t, spawnWait, "the CLI async completion event", func() bool { return len(h.notifications(t)) == 1 })
 
 	params, _ := h.notifications(t)[0]["params"].(map[string]any)
 	if content, _ := params["content"].(string); !strings.Contains(content, "background CLI answer") {
@@ -241,7 +246,7 @@ echo done`)
 		_, err := h.b.askAmpExplicit("T-same", "background")
 		background <- err
 	}()
-	waitFor(t, "the first CLI turn to start", func() bool {
+	waitUpTo(t, spawnWait, "the first CLI turn to start", func() bool {
 		_, err := os.Stat(ready)
 		return err == nil
 	})

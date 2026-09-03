@@ -474,14 +474,25 @@ func dialBridge(t *testing.T, sock string) net.Conn {
 // waitFor polls until cond holds, so tests never depend on a fixed sleep.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	waitUpTo(t, 5*time.Second, what, cond)
+}
+
+// waitUpTo is waitFor with an explicit budget, for conditions that are not
+// in-process bookkeeping. Five seconds is generous for a goroutine writing to a
+// slice and far too tight for a fork+exec: on a busy machine macOS has taken
+// north of ten seconds to spawn a trivial /bin/sh, which turned every test that
+// waits on the fake Amp CLI into a load test of the developer's laptop. Waiting
+// longer costs nothing when the condition is met, which is the normal case.
+func waitUpTo(t *testing.T, budget time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", what)
+	t.Fatalf("timed out waiting for %s after %s", what, budget)
 }
 
 func TestSocketRoundTrip(t *testing.T) {

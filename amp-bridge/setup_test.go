@@ -229,7 +229,16 @@ func TestCheckMCPConfigRejectsANonExecutable(t *testing.T) {
 }
 
 func TestCheckMCPTargetRunsTheBinary(t *testing.T) {
-	// Not parallel: the subtest below adjusts the shared probe timeout.
+	// Not parallel: this test adjusts the shared probe timeout.
+
+	// The three classification cases below are about what checkMCPTarget makes
+	// of an exit status, not about how fast this machine forks. The production
+	// 20s is sized for a loaded laptop and still loses to one that is very
+	// loaded, so give the classification cases the same spawn budget the rest of
+	// the suite uses; the deliberate timeout case at the end sets its own.
+	restoreProbe := mcpProbeTimeout
+	mcpProbeTimeout = spawnWait
+	defer func() { mcpProbeTimeout = restoreProbe }()
 
 	// A regular, executable file that the OS kills at exec is indistinguishable
 	// from a healthy one until you run it — that is the invalidated-signature
@@ -258,9 +267,7 @@ func TestCheckMCPTargetRunsTheBinary(t *testing.T) {
 	// need not wait the real bound out; what is under test is that the bound
 	// holds at all, and that a grandchild holding the output pipe cannot
 	// extend it past it.
-	restore := mcpProbeTimeout
 	mcpProbeTimeout = 2 * time.Second
-	defer func() { mcpProbeTimeout = restore }()
 
 	hangs := script(t, "sleep 30")
 	start := time.Now()

@@ -131,3 +131,41 @@ it already matches `maxReplyWait`.
 `UserPromptSubmit hook timed out after 10s` / `after 30s — output discarded`.
 That is a Claude Code hook, not amp-bridge. Worth chasing separately.
 
+## Implementation note: the test suite's own timeout cliff
+
+Implementing the above turned three tests red. They fail at HEAD too, so they
+are not caused by the change, but the diagnosis is worth keeping because the
+symptom is misleading.
+
+**First (wrong) theory:** macOS pays a one-time security check on the first exec
+of a freshly written script, and the fake Amp CLI stubs were losing a 5s
+`waitFor` to it. Fix attempted: a `warmExec` helper that execs the stub once
+during setup.
+
+**Measurement that killed it** (2026-09-02, on this machine):
+
+```
+./t1  0.954 total     # first exec of a fresh #!/bin/sh script
+./t1  7.494 total     # second exec of the same file
+./t1  1.839 total     # third
+/bin/sh -c 'exit 0'  16.755 total, 0% cpu
+```
+
+A second exec being slower than the first rules out a per-file first-exec
+check, and 16.7s at 0% CPU for the system `/bin/sh` rules out anything specific
+to the test stubs. `uptime` explained it: **load average 245–378, 5201
+processes** — another project's agent worktrees fanning out `prettier`, plus a
+MacPaw Moonlock system extension at 165% CPU scanning every exec.
+
+**Actual fix:** the tests gave a `fork+exec` the same 5s budget as in-process
+bookkeeping. Added `waitUpTo(t, budget, ...)` next to `waitFor` in
+`channel_test.go` and gave the three spawn-bound waits 30s
+(`spawnWait` in `amp_test.go`; `mcpProbeTimeout` raised to it for the
+classification cases in `TestCheckMCPTargetRunsTheBinary`). `warmExec` was
+reverted. No production timeout was loosened — `mcpProbeTimeout` stays 20s
+outside tests.
+
+**Rule of thumb this leaves behind:** in this suite, a budget that bounds a
+subprocess spawn is a different order of magnitude from one that bounds a
+goroutine appending to a slice. Sharing one constant between them makes the
+suite a load test of whatever else the laptop is doing.
