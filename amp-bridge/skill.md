@@ -206,7 +206,7 @@ depends on the answer.
 
 An enabled inbox can append into an open Amp thread, but the Amp plugin API cannot
 wake that thread while it is idle. In that case the completion arrives with
-`status="error"` and says the message is queued but unanswered for now. Do not
+`status="pending"` and says the message is queued but unanswered for now. Do not
 resend it. Ask the user to do anything in that Amp thread; later activity may
 pick up the queued request. Treat `send_amp` to an open interactive thread as
 assisted handoff, not unattended background execution.
@@ -248,6 +248,7 @@ nothing is delivered. `amp-bridge init` repairs that one.
 | `ask_amp`: `did not start a turn for it` | Your question IS queued in the thread. Do not resend — that duplicates it. Ask your user to continue in that thread; the next activity may pick it up. |
 | `send_amp`: `too many send_amp requests in flight` | The background cap is full. Wait for a completion event before starting another. Slots are held for the length of Amp's turn, so a long review holds one for minutes. |
 | `<channel async_id=… status="pending">` | Delivered; Amp is still working. Not a failure and not resendable — read the thread for the outcome. |
+| `<channel async_id=… status="not-delivered">` | Nothing was appended. This is the one completion status where resending is safe. |
 | `<channel async_id=… status="unknown">` | The bridge lost track before the turn ended. Check the thread before deciding anything. |
 | `another CLI fallback turn … is already in flight` | That idle thread is already running a bridge-started turn. Wait for it, or enable the inbox if queued turns are required. |
 | `<channel async_id=… status="error">` | The background request was accepted but its Amp turn failed. Read the event; do not call `reply`. |

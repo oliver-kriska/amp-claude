@@ -5,6 +5,12 @@ live Claude Code session talk to each other, in both directions, on this machine
 
 If you are Amp working in this repo, this file tells you how to use it.
 
+Human-facing documentation lives in [`README.md`](README.md) and
+[`docs/`](docs/) (getting started, operations, development). The runtime
+instructions Claude loads are in
+[`.claude/skills/amp-bridge/SKILL.md`](.claude/skills/amp-bridge/SKILL.md) —
+edit that file, never the generated `amp-bridge/skill.md`.
+
 ## What it is
 
 `amp-bridge` runs as a Claude Code **channel** — an MCP server that can push
@@ -101,6 +107,7 @@ at a stale build, where everything reports healthy and nothing is delivered.
 | exit 1, `timed out waiting for Claude` | Socket fine and event delivered, but no timely `reply`. Use the printed `--result` command; a late answer is retained in memory until expiry unless the bridge restarts. |
 | exit 1, `timed out waiting for Claude` *after* Claude appeared to answer | Claude replied without a `request_id` while several requests were in flight. The bridge refuses to guess and tells Claude so; if Claude does not retry with the id, your call just times out. You never see the guard message itself — it goes to Claude, not to you. |
 | `another CLI fallback turn … is already in flight` | The same idle thread is already running a bridge-started turn. Wait, or enable its inbox when turns need to queue. |
+| `produced no answer` | The Amp turn ran to completion and emitted no text. It is not a delivery failure — inspect the thread and rephrase; a verbatim resend earns the same silence. |
 | exit 137 | The binary was replaced with `cp`, invalidating its macOS code signature. Rebuild, don't work around it. |
 
 Server-side view: `~/.local/state/amp-bridge/amp-bridge.log` — look for `EVENT_PUSHED`,
