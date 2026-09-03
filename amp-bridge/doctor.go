@@ -66,6 +66,7 @@ func cmdDoctor(cfg config, dir string, strict bool) int {
 		checkInstalledSkill(),
 		checkAmpCLI(cfg),
 		checkTimeoutOrdering(cfg),
+		checkSendBudget(cfg),
 		checkLog(),
 	}
 
@@ -131,6 +132,32 @@ func checkTimeoutOrdering(cfg config) check {
 		name, statusOK,
 		fmt.Sprintf("ask_amp worst-case %s leaves %s before the %s Claude reply deadline",
 			outboundBound, remaining, cfg.replyWait), "",
+	}
+}
+
+// checkSendBudget reports the asynchronous budget, which deliberately does not
+// participate in the nesting constraint above: send_amp blocks no one. The only
+// way to get it wrong is to set it past what the plugin will honour.
+func checkSendBudget(cfg config) check {
+	const name = "send budget"
+	if cfg.ampDisabled {
+		return check{name, statusOK, "outbound disabled", ""}
+	}
+	inboxEffective := min(cfg.sendTimeout-inboxTimeoutLead, pluginMaxTimeout)
+	if cfg.sendTimeout-inboxTimeoutLead > pluginMaxTimeout {
+		return check{
+			name, statusWarn,
+			fmt.Sprintf(
+				"send_amp budget %s exceeds what the plugin honours: inbox deliveries stop at "+
+					"%s (its MAX_TIMEOUT_MS), CLI-fallback turns use the full %s",
+				cfg.sendTimeout, pluginMaxTimeout, cfg.sendTimeout),
+			"set AMP_BRIDGE_SEND_TIMEOUT to 10m0s or less so both sides use the same clock",
+		}
+	}
+	return check{
+		name, statusOK,
+		fmt.Sprintf("send_amp waits %s (%s at the plugin), independent of the ask_amp deadline",
+			cfg.sendTimeout, inboxEffective), "",
 	}
 }
 

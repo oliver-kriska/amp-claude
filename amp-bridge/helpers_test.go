@@ -73,7 +73,10 @@ func testConfig() config {
 		logBodies:       false,
 		ampBin:          "amp",
 		ampTimeout:      time.Second,
-		ampDisabled:     true,
+		// Deliberately larger than ampTimeout, mirroring production: the
+		// asynchronous path is the one that can afford to wait.
+		sendTimeout: 3 * time.Second,
+		ampDisabled: true,
 	}
 }
 

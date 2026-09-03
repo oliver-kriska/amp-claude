@@ -449,7 +449,9 @@ func (b *bridge) handleAskAmp(id, args json.RawMessage) {
 	}
 	out, err := b.askAmp(a.ThreadID, a.Text)
 	if err != nil {
-		b.logf("ASK_AMP_FAILED %v", err)
+		// The state is the part worth grepping for later: it is the difference
+		// between a lost message and a duplicated one.
+		b.logf("ASK_AMP_FAILED delivery=%s %v", classifyDelivery(err), err)
 		b.reply(id, toolResult(err.Error(), true))
 		return
 	}
@@ -536,9 +538,31 @@ func (b *bridge) pushAsyncCompletion(asyncID, threadID, out string, askErr error
 	content := "Async Amp request " + asyncID + " completed for thread " + threadID +
 		". Amp replied:\n\n" + out
 	if askErr != nil {
-		status = "error"
-		content = "Async Amp request " + asyncID + " failed for thread " + threadID +
-			":\n\n" + askErr.Error()
+		// One status for every failure is what made this path dangerous: the
+		// caller could not tell "never arrived, retry" from "arrived and still
+		// running, never retry", and the safe move and the useful move point in
+		// opposite directions. Carry the distinction all the way out.
+		var verdict string
+		switch classifyDelivery(askErr) {
+		case deliveryPending:
+			status = "pending"
+			verdict = "Async Amp request " + asyncID + " was DELIVERED to thread " + threadID +
+				" and Amp is still working on it. This is not a failure and must not be " +
+				"resent — a second send duplicates it. Read the thread for the outcome"
+		case deliveryNotSent:
+			status = "not-delivered"
+			verdict = "Async Amp request " + asyncID + " never reached thread " + threadID +
+				". Nothing was appended, so resending is safe"
+		case deliveryFailed:
+			status = "error"
+			verdict = "Async Amp request " + asyncID + " reached thread " + threadID +
+				" but its Amp turn failed"
+		default:
+			status = "unknown"
+			verdict = "Async Amp request " + asyncID + " has an unknown outcome for thread " +
+				threadID + ". It may already be in the thread — check before resending"
+		}
+		content = verdict + ":\n\n" + askErr.Error()
 	}
 	content += "\n\nNo reply is required; this is a send_amp completion event."
 	normalized := strings.ToValidUTF8(content, "�")

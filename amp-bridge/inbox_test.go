@@ -126,6 +126,8 @@ func inboxHarness(t *testing.T, p *fakePlugin, threadID string, mutate ...func(*
 		c.ampDisabled = false
 		c.ampBin = bin
 		c.ampTimeout = 60 * time.Second
+		// Larger than ampTimeout, as in production: send_amp blocks nobody.
+		c.sendTimeout = 120 * time.Second
 	}
 	return newHarness(t, append([]func(*config){base}, mutate...)...)
 }
@@ -408,7 +410,10 @@ func TestInboxErrorCodesAreActionable(t *testing.T) {
 		{"disabled", "check it before resending"},
 		{"turn-error", "before answering"},
 		{"turn-cancelled", "before answering"},
-		{"timeout", "did not finish in time"},
+		// A plugin that predates the `delivered` field leaves us unable to say
+		// which kind of timeout this was, and unknown must never read as
+		// "safe to retry". See TestTimeoutDistinguishesDeliveredFromQueued.
+		{"timeout", "Check the thread before resending"},
 		// The distinguishing fact is that the question already landed, so the
 		// message must steer the caller away from resending it.
 		{"no-turn", "do not resend"},
@@ -463,6 +468,8 @@ func TestInboxRefusesUntrustedRuntimeDir(t *testing.T) {
 		c.ampDisabled = false
 		c.ampBin = bin
 		c.ampTimeout = 60 * time.Second
+		// Larger than ampTimeout, as in production: send_amp blocks nobody.
+		c.sendTimeout = 120 * time.Second
 	})
 
 	_, err := h.b.askAmp("T-open", "hello")
@@ -580,5 +587,190 @@ func TestExecutorDiagnosisPointsAtThePluginRoute(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("diagnosis %q must mention %q", got, want)
 		}
+	}
+}
+
+// The 110s cliff in miniature. Two thirds of real Claude->Amp requests were
+// discarded because send_amp, which blocks nobody, shared ask_amp's nesting
+// budget. Here the plugin answers after the synchronous deadline but well
+// inside the asynchronous one: the synchronous call must give up and the
+// asynchronous one must still get its answer.
+func TestSendAmpOutlivesTheSynchronousBudget(t *testing.T) {
+	answer := func(t *testing.T) (*fakePlugin, chan struct{}) {
+		t.Helper()
+		p := newFakePlugin(t, "T-open")
+		gate := make(chan struct{})
+		p.replyGate = gate
+		p.reply = inboxReply{Reply: "amp finished, late"}
+		return p, gate
+	}
+
+	t.Run("ask_amp still gives up", func(t *testing.T) {
+		p, gate := answer(t)
+		defer close(gate) // never opened in time
+		h := inboxHarness(t, p, "T-open", func(c *config) {
+			c.ampTimeout = 150 * time.Millisecond
+			c.sendTimeout = 10 * time.Second
+		})
+		_, err := h.b.askAmp("T-open", "hello")
+		if err == nil {
+			t.Fatal("ask_amp must stay bounded by the synchronous budget")
+		}
+	})
+
+	t.Run("send_amp waits and gets the answer", func(t *testing.T) {
+		p, gate := answer(t)
+		h := inboxHarness(t, p, "T-open", func(c *config) {
+			c.ampTimeout = 150 * time.Millisecond
+			c.sendTimeout = 10 * time.Second
+		})
+		go func() {
+			// Past the synchronous deadline, nowhere near the asynchronous one.
+			time.Sleep(400 * time.Millisecond)
+			close(gate)
+		}()
+		out, err := h.b.askAmpExplicit("T-open", "hello")
+		if err != nil {
+			t.Fatalf("send_amp must outlive the ask_amp budget, got %v", err)
+		}
+		if out != "amp finished, late" {
+			t.Errorf("send_amp returned %q, want the late answer", out)
+		}
+	})
+}
+
+// The budget must actually reach the plugin, since the plugin runs its own
+// timer against it. Asserting the wire value keeps the two sides honest without
+// waiting for either clock.
+func TestBudgetOnTheWireMatchesTheCaller(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(*harness) (string, error)
+		want time.Duration
+	}{
+		{"ask_amp", func(h *harness) (string, error) { return h.b.askAmp("T-open", "hi") }, 20 * time.Second},
+		{"send_amp", func(h *harness) (string, error) { return h.b.askAmpExplicit("T-open", "hi") }, 90 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newFakePlugin(t, "T-open")
+			p.reply = inboxReply{Reply: "ok"}
+			h := inboxHarness(t, p, "T-open", func(c *config) {
+				c.ampTimeout = 30 * time.Second
+				c.sendTimeout = 100 * time.Second
+			})
+			if _, err := tc.call(h); err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			var frame struct {
+				TimeoutMS int64 `json:"timeout_ms"`
+			}
+			select {
+			case raw := <-p.askFrame:
+				if err := json.Unmarshal(raw, &frame); err != nil {
+					t.Fatalf("decode ask frame: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("no ask frame reached the plugin")
+			}
+			// The plugin's deadline sits one lead inside ours so its richer
+			// diagnosis wins the race.
+			if got := time.Duration(frame.TimeoutMS) * time.Millisecond; got != tc.want {
+				t.Errorf("plugin budget %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// The distinction that cost the most: both are code=timeout, and they demand
+// opposite responses. Getting this wrong either loses a message or duplicates
+// one, so absent information must never read as "safe to retry".
+func TestTimeoutDistinguishesDeliveredFromQueued(t *testing.T) {
+	yes, no := true, false
+	for _, tc := range []struct {
+		name      string
+		delivered *bool
+		state     deliveryState
+		want      string
+	}{
+		{"appended and running", &yes, deliveryPending, "Do not resend"},
+		{"never left the queue", &no, deliveryNotSent, "safe to retry"},
+		{"plugin too old to say", nil, deliveryUnknown, "Check the thread before resending"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newFakePlugin(t, "T-open")
+			p.reply = inboxReply{
+				Error: "the Amp turn did not finish in time", Code: "timeout", Delivered: tc.delivered,
+			}
+			h := inboxHarness(t, p, "T-open")
+
+			_, err := h.b.askAmp("T-open", "hello")
+			if err == nil {
+				t.Fatal("a timeout must surface as an error")
+			}
+			if got := classifyDelivery(err); got != tc.state {
+				t.Errorf("classified as %s, want %s", got, tc.state)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("message %q must contain %q", err, tc.want)
+			}
+			// The plugin's own diagnosis is never discarded in favour of ours.
+			if !strings.Contains(err.Error(), "did not finish in time") {
+				t.Errorf("message %q dropped the plugin's explanation", err)
+			}
+		})
+	}
+}
+
+// A send that reached the thread must never be reported as a failure. The
+// caller cannot see the thread, so "error" reads as "nothing happened" and the
+// obvious recovery — send it again — is the one action that does harm.
+func TestDeliveredSendReportsPendingNotFailure(t *testing.T) {
+	appended := true
+	for _, tc := range []struct {
+		name       string
+		reply      inboxReply
+		wantStatus string
+		wantText   string
+	}{
+		{
+			"appended and still running",
+			inboxReply{Error: "the Amp turn did not finish in time", Code: "timeout", Delivered: &appended},
+			"pending", "must not be resent",
+		},
+		{
+			"never appended",
+			inboxReply{Error: "no inbox", Code: "not-enabled"},
+			"not-delivered", "resending is safe",
+		},
+		{
+			"outcome unknowable",
+			inboxReply{Error: "the Amp turn did not finish in time", Code: "timeout"},
+			"unknown", "check before resending",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newFakePlugin(t, "T-open")
+			p.reply = tc.reply
+			h := inboxHarness(t, p, "T-open")
+
+			h.call(t, sendAmpCall("sa", "T-open", "do the review"))
+			if res := result(t, h.response(t, "sa")); isToolError(t, res) {
+				t.Fatalf("accepted async work should return a handle: %v", res)
+			}
+			waitFor(t, "the async completion event", func() bool { return len(h.notifications(t)) == 1 })
+
+			params, _ := h.notifications(t)[0]["params"].(map[string]any)
+			meta, _ := params["meta"].(map[string]any)
+			if meta["status"] != tc.wantStatus {
+				t.Errorf("status = %v, want %v", meta["status"], tc.wantStatus)
+			}
+			content, _ := params["content"].(string)
+			if !strings.Contains(content, tc.wantText) {
+				t.Errorf("content %q must contain %q", content, tc.wantText)
+			}
+			// The slot has to come back regardless of how the turn ended, or a
+			// run of these exhausts the cap and blocks every later send.
+			waitFor(t, "the async slot to be released", func() bool { return len(h.b.asyncSlots) == 0 })
+		})
 	}
 }

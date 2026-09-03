@@ -87,7 +87,8 @@ Environment:
   AMP_BRIDGE_MAX_TIMEOUT    longest per-request --timeout    (default 15m0s)
   AMP_BRIDGE_RESULT_TTL     retain replies after timeout     (default 1h0m0s)
   AMP_BRIDGE_MAX_RESULTS    retained late-reply cap          (default 64)
-  AMP_BRIDGE_AMP_TIMEOUT    how long ask_amp/send_amp waits  (default 2m0s)
+  AMP_BRIDGE_AMP_TIMEOUT    how long ask_amp waits           (default 2m0s)
+  AMP_BRIDGE_SEND_TIMEOUT   how long send_amp waits          (default 10m0s)
   AMP_BRIDGE_LOG            log file (default ~/.local/state/amp-bridge/amp-bridge.log)
   AMP_BRIDGE_LOG_BODIES     1 to log frame bodies (contains conversation text)
   AMP_BRIDGE_DIR            runtime/registry directory

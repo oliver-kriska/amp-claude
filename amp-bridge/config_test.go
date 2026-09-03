@@ -188,6 +188,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 		logBodies:       false,
 		ampBin:          "amp",
 		ampTimeout:      120 * time.Second,
+		sendTimeout:     10 * time.Minute,
 		ampDisabled:     false,
 	}
 	if got != want {
@@ -205,6 +206,7 @@ func TestLoadConfigFromEnvironment(t *testing.T) {
 	t.Setenv("AMP_BRIDGE_LOG_BODIES", "1")
 	t.Setenv("AMP_BIN", "/usr/local/bin/amp")
 	t.Setenv("AMP_BRIDGE_AMP_TIMEOUT", "30s")
+	t.Setenv("AMP_BRIDGE_SEND_TIMEOUT", "4m")
 	t.Setenv("AMP_BRIDGE_DISABLE_OUTBOUND", "1")
 
 	got := loadConfig()
@@ -218,6 +220,7 @@ func TestLoadConfigFromEnvironment(t *testing.T) {
 		logBodies:       true,
 		ampBin:          "/usr/local/bin/amp",
 		ampTimeout:      30 * time.Second,
+		sendTimeout:     4 * time.Minute,
 		ampDisabled:     true,
 	}
 	if got != want {

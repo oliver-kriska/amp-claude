@@ -706,3 +706,39 @@ func TestInstalledSkillPathIsUnderHome(t *testing.T) {
 		t.Errorf("installSkill did not write where the check looks: %v", err)
 	}
 }
+
+// The send budget is deliberately outside the nesting constraint, so the only
+// way to misconfigure it is to set it past what the plugin will honour — at
+// which point the number in the environment stops describing what happens.
+func TestDoctorReportsTheSendBudget(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.ampDisabled = false
+	cfg.ampTimeout = 2 * time.Minute
+	cfg.sendTimeout = 10 * time.Minute
+
+	got := checkSendBudget(cfg)
+	if got.status != statusOK {
+		t.Errorf("10m should be healthy, got %s: %s", got.status.symbol(), got.detail)
+	}
+	if !strings.Contains(got.detail, "independent of the ask_amp deadline") {
+		t.Errorf("detail should say the budgets are decoupled, got %q", got.detail)
+	}
+
+	over := cfg
+	over.sendTimeout = 30 * time.Minute
+	got = checkSendBudget(over)
+	if got.status != statusWarn {
+		t.Fatalf("a budget past the plugin ceiling should warn, got %s", got.status.symbol())
+	}
+	if !strings.Contains(got.fix, "AMP_BRIDGE_SEND_TIMEOUT") {
+		t.Errorf("warning must name the setting to change, got %q", got.fix)
+	}
+
+	disabled := cfg
+	disabled.ampDisabled = true
+	if got := checkSendBudget(disabled); got.status != statusOK {
+		t.Errorf("outbound-disabled bridge should not warn, got %s", got.status.symbol())
+	}
+}

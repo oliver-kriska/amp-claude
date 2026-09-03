@@ -35,6 +35,15 @@ type config struct {
 	ampBin string
 	// ampTimeout bounds a single `amp threads continue` turn.
 	ampTimeout time.Duration
+	// sendTimeout bounds a send_amp turn, which blocks nobody and so has no
+	// reason to share ask_amp's nesting budget. Two thirds of outbound requests
+	// were being discarded at ampTimeout while Amp was still working.
+	//
+	// The ceiling is not arbitrary: the plugin clamps any budget we send to its
+	// own MAX_TIMEOUT_MS (600 s, amp-bridge-inbox.ts). Past that the plugin
+	// answers on its schedule while we wait on ours, so the configured number
+	// would stop meaning anything. Keep the two in step.
+	sendTimeout time.Duration
 	// ampDisabled switches off the Claude->Amp direction entirely.
 	ampDisabled bool
 }
@@ -43,6 +52,11 @@ func loadConfig() config {
 	replyWait := envDuration("AMP_BRIDGE_TIMEOUT", 180*time.Second)
 	maxReplyWait := envDuration("AMP_BRIDGE_MAX_TIMEOUT", 15*time.Minute)
 	maxReplyWait = max(maxReplyWait, replyWait)
+
+	ampTimeout := envDuration("AMP_BRIDGE_AMP_TIMEOUT", 120*time.Second)
+	// A send budget below the synchronous one would be a strict downgrade: the
+	// asynchronous path is the one that can afford to wait.
+	sendTimeout := max(envDuration("AMP_BRIDGE_SEND_TIMEOUT", 10*time.Minute), ampTimeout)
 
 	return config{
 		maxInFlight:     envInt("AMP_BRIDGE_MAX_INFLIGHT", 8),
@@ -53,7 +67,8 @@ func loadConfig() config {
 		maxResults:      envInt("AMP_BRIDGE_MAX_RESULTS", 64),
 		logBodies:       os.Getenv("AMP_BRIDGE_LOG_BODIES") == "1",
 		ampBin:          envStr("AMP_BIN", "amp"),
-		ampTimeout:      envDuration("AMP_BRIDGE_AMP_TIMEOUT", 120*time.Second),
+		ampTimeout:      ampTimeout,
+		sendTimeout:     sendTimeout,
 		ampDisabled:     os.Getenv("AMP_BRIDGE_DISABLE_OUTBOUND") == "1",
 	}
 }

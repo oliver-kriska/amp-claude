@@ -42,6 +42,12 @@ const (
 	// diagnostic ("thread is awaiting-approval") wins the race against our bare
 	// read deadline instead of arriving after we have given up.
 	inboxTimeoutLead = 10 * time.Second
+
+	// pluginMaxTimeout mirrors MAX_TIMEOUT_MS in amp-bridge-inbox.ts, which
+	// clamps whatever budget we send it. Beyond this the two sides are waiting
+	// on different clocks and the configured number stops describing what
+	// happens — so doctor says so rather than letting it look effective.
+	pluginMaxTimeout = 600 * time.Second
 )
 
 // inboxEntry is one enabled thread, written by the plugin and read by us.
@@ -79,6 +85,66 @@ type inboxReply struct {
 	Reply string `json:"reply"`
 	Error string `json:"error"`
 	Code  string `json:"code"`
+	// Delivered says whether the message reached the thread before the failure.
+	// A pointer because absent and false mean different things: a plugin that
+	// predates this field tells us nothing, and guessing "not delivered" there
+	// would invite the duplicate this whole path exists to avoid. Additive, so
+	// no protocol bump — an old plugin omits it and an old bridge ignores it.
+	Delivered *bool `json:"delivered,omitempty"`
+}
+
+// deliveryState is what the caller needs in order to decide whether resending
+// is safe. Collapsing these into one "error" is what cost us: "never arrived"
+// and "arrived, still running" demand opposite actions, so a caller told only
+// "failed" gets it wrong half the time.
+type deliveryState int
+
+const (
+	// deliveryUnknown — it may or may not be in the thread. Check before acting.
+	deliveryUnknown deliveryState = iota
+	// deliveryNotSent — definitely not in the thread. Safe to retry.
+	deliveryNotSent
+	// deliveryPending — in the thread and Amp is still working. Never retry.
+	deliveryPending
+	// deliveryFailed — in the thread; the turn itself failed. Retry is a
+	// judgement call, not a safe default.
+	deliveryFailed
+)
+
+func (d deliveryState) String() string {
+	switch d {
+	case deliveryNotSent:
+		return "not-delivered"
+	case deliveryPending:
+		return "pending"
+	case deliveryFailed:
+		return "turn-failed"
+	default:
+		return "unknown"
+	}
+}
+
+// deliveryError carries that classification alongside the human-readable cause.
+type deliveryError struct {
+	state deliveryState
+	err   error
+}
+
+func (e *deliveryError) Error() string { return e.err.Error() }
+func (e *deliveryError) Unwrap() error { return e.err }
+
+func deliveryFault(state deliveryState, format string, a ...any) error {
+	return &deliveryError{state: state, err: fmt.Errorf(format, a...)}
+}
+
+// classifyDelivery reads the state out of an error, defaulting to unknown.
+// Unknown is the safe default: every path that has not proven the message
+// stayed out of the thread must not invite a resend.
+func classifyDelivery(err error) deliveryState {
+	if d, ok := errors.AsType[*deliveryError](err); ok {
+		return d.state
+	}
+	return deliveryUnknown
 }
 
 // trustedSubdir applies the runtime directory's own predicate one level down.
@@ -248,7 +314,7 @@ func (b *bridge) lookupInbox(threadID string) (inboxEntry, bool, error) {
 // There is no retry and no fallback here, by design: once the ask frame has been
 // written the message may already be in the thread, so a second attempt risks
 // delivering it twice. Every failure is reported, never papered over.
-func (b *bridge) askViaInbox(e inboxEntry, threadID, text string) (string, error) {
+func (b *bridge) askViaInbox(e inboxEntry, threadID, text string, budget time.Duration) (string, error) {
 	id, err := newRequestID()
 	if err != nil {
 		return "", err
@@ -260,7 +326,8 @@ func (b *bridge) askViaInbox(e inboxEntry, threadID, text string) (string, error
 	conn, err := d.DialContext(dialCtx, "unix", e.Socket)
 	if err != nil {
 		// Nothing was written, so this is still a safe place to fall back from.
-		return "", fmt.Errorf("plugin inbox for %s did not accept a connection: %w", threadID, err)
+		return "", deliveryFault(deliveryNotSent,
+			"plugin inbox for %s did not accept a connection: %w", threadID, err)
 	}
 	defer func() { _ = conn.Close() }()
 	// A deadline alone does not react when the bridge shuts down. Close the
@@ -270,11 +337,11 @@ func (b *bridge) askViaInbox(e inboxEntry, threadID, text string) (string, error
 	defer stopCancel()
 
 	// Slightly past the plugin's own deadline, so its diagnosis arrives first.
-	if err := conn.SetDeadline(time.Now().Add(b.cfg.ampTimeout + inboxTimeoutLead)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(budget + inboxTimeoutLead)); err != nil {
 		return "", err
 	}
 
-	pluginBudget := max(b.cfg.ampTimeout-inboxTimeoutLead, time.Second)
+	pluginBudget := max(budget-inboxTimeoutLead, time.Second)
 	req := inboxAskRequest{
 		Op:        "ask",
 		ID:        id,
@@ -283,13 +350,16 @@ func (b *bridge) askViaInbox(e inboxEntry, threadID, text string) (string, error
 		From:      b.identityName(),
 		TimeoutMS: pluginBudget.Milliseconds(),
 	}
-	b.logf("INBOX_ASK thread=%s req=%s pid=%d bytes=%d", threadID, id, e.PluginPID, len(text))
+	b.logf("INBOX_ASK thread=%s req=%s pid=%d bytes=%d budget=%s",
+		threadID, id, e.PluginPID, len(text), budget)
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		if b.ctx.Err() != nil {
-			return "", errors.New("bridge is shutting down; the Amp turn was cancelled")
+			return "", deliveryFault(deliveryUnknown,
+				"bridge is shutting down while writing to the plugin inbox. The message may "+
+					"already be in thread %s — check it before resending", threadID)
 		}
 		// Ambiguous by construction: some bytes may have been accepted.
-		return "", fmt.Errorf(
+		return "", deliveryFault(deliveryUnknown,
 			"writing to the plugin inbox failed partway (%w). The message may or may not "+
 				"have reached thread %s — check it before resending", err, threadID,
 		)
@@ -297,42 +367,76 @@ func (b *bridge) askViaInbox(e inboxEntry, threadID, text string) (string, error
 
 	var r inboxReply
 	if err := json.NewDecoder(conn).Decode(&r); err != nil {
+		// Past the write, every failure is ambiguous: the frame is with the
+		// plugin and the turn may be under way even though we cannot hear it.
 		if b.ctx.Err() != nil {
-			return "", errors.New("bridge is shutting down; the Amp turn was cancelled")
+			return "", deliveryFault(deliveryUnknown,
+				"bridge is shutting down before Amp answered. The message may already be in "+
+					"thread %s — check it before resending", threadID)
 		}
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return "", fmt.Errorf(
+			return "", deliveryFault(deliveryUnknown,
 				"the plugin inbox closed mid-request (the Amp session may have exited or "+
 					"reloaded its plugins). The message may or may not have reached thread %s "+
 					"— check it before resending", threadID,
 			)
 		}
-		return "", fmt.Errorf("reading the plugin inbox reply failed: %w", err)
+		return "", deliveryFault(deliveryUnknown,
+			"reading the plugin inbox reply failed: %w", err)
 	}
 	if r.Error != "" {
-		b.logf("INBOX_FAILED thread=%s req=%s code=%s", threadID, id, r.Code)
-		return "", inboxCodeError(r, threadID)
+		state := inboxDeliveryState(r)
+		b.logf("INBOX_FAILED thread=%s req=%s code=%s delivery=%s", threadID, id, r.Code, state)
+		return "", inboxCodeError(r, threadID, state)
 	}
 	b.logf("INBOX_OK thread=%s req=%s bytes=%d", threadID, id, len(r.Reply))
 	return r.Reply, nil
 }
 
+// inboxDeliveryState decides, per code, whether the message reached the thread.
+//
+// Only `timeout` is genuinely ambiguous from the code alone — the plugin uses it
+// both for "queued behind another request" and for "appended, turn still
+// running" — so that case defers to the explicit `delivered` field and falls
+// back to unknown when talking to a plugin too old to send it.
+func inboxDeliveryState(r inboxReply) deliveryState {
+	switch r.Code {
+	case "not-enabled", "busy", "append-failed":
+		// The plugin refused before appending, so the thread is untouched.
+		return deliveryNotSent
+	case "no-turn":
+		return deliveryPending
+	case "turn-error", "turn-cancelled":
+		return deliveryFailed
+	case "timeout":
+		if r.Delivered == nil {
+			return deliveryUnknown
+		}
+		if *r.Delivered {
+			return deliveryPending
+		}
+		return deliveryNotSent
+	default:
+		return deliveryUnknown
+	}
+}
+
 // inboxCodeError turns the plugin's machine code into something an operator can
 // act on. The plugin's own message is preserved; the code decides what to add.
-func inboxCodeError(r inboxReply, threadID string) error {
+func inboxCodeError(r inboxReply, threadID string, state deliveryState) error {
 	switch r.Code {
 	case "not-enabled":
-		return fmt.Errorf(
+		return deliveryFault(state,
 			"thread %s has not enabled its Claude inbox — press Ctrl+O in that Amp session "+
 				"and run 'amp-bridge: Enable Claude inbox for this thread'", threadID,
 		)
 	case "busy":
-		return fmt.Errorf(
+		return deliveryFault(state,
 			"the Claude inbox for %s already has requests queued — Amp has not finished the "+
-				"earlier turns yet", threadID,
+				"earlier turns yet. Nothing was appended, so this is safe to retry", threadID,
 		)
 	case "disabled":
-		return fmt.Errorf(
+		return deliveryFault(state,
 			"the Claude inbox for %s was disabled or the plugin reloaded while the request "+
 				"was in flight. The message may or may not have reached the thread — check it "+
 				"before resending", threadID,
@@ -341,21 +445,42 @@ func inboxCodeError(r inboxReply, threadID string) error {
 		// Distinct from a timeout: the question is in the thread, so resending
 		// it duplicates rather than retries. Say that plainly — the caller
 		// cannot see the thread and would otherwise assume nothing landed.
-		return fmt.Errorf(
+		return deliveryFault(state,
 			"%s — do not resend the same question, it is already there", r.Error,
 		)
 	case "turn-error", "turn-cancelled":
-		return fmt.Errorf("the Amp turn %s before answering — check thread %s",
+		return deliveryFault(state, "the Amp turn %s before answering — check thread %s",
 			strings.TrimPrefix(r.Code, "turn-"), threadID)
 	case "timeout":
-		return fmt.Errorf("the Amp turn did not finish in time: %s", r.Error)
+		// The distinction the caller actually needs. "Delivered and running" and
+		// "never left the queue" are both timeouts and want opposite responses,
+		// so never let them share one sentence.
+		switch state {
+		case deliveryPending:
+			return deliveryFault(state,
+				"%s — the message IS in thread %s and Amp is still working on it. Do not "+
+					"resend: that would duplicate it. Read the thread for the answer", r.Error, threadID,
+			)
+		case deliveryNotSent:
+			return deliveryFault(state,
+				"%s — nothing was appended to thread %s, so this is safe to retry", r.Error, threadID,
+			)
+		default:
+			return deliveryFault(state,
+				"%s — this build cannot tell whether thread %s received it (the running Amp "+
+					"plugin predates delivery reporting; reload plugins in Amp). Check the "+
+					"thread before resending", r.Error, threadID,
+			)
+		}
 	case "append-failed":
-		return fmt.Errorf("the plugin could not append to thread %s: %s", threadID, r.Error)
+		return deliveryFault(state,
+			"the plugin could not append to thread %s: %s. Nothing landed, so this is safe "+
+				"to retry", threadID, r.Error)
 	default:
 		if r.Code != "" {
-			return fmt.Errorf("plugin inbox error (%s): %s", r.Code, r.Error)
+			return deliveryFault(state, "plugin inbox error (%s): %s", r.Code, r.Error)
 		}
-		return fmt.Errorf("plugin inbox error: %s", r.Error)
+		return deliveryFault(state, "plugin inbox error: %s", r.Error)
 	}
 }
 

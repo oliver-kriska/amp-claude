@@ -37,6 +37,9 @@ func ampHarness(t *testing.T, script string) *harness {
 		// a tight budget here makes every test that shells out flaky. The tests
 		// that actually exercise the timeout set their own short one.
 		c.ampTimeout = 60 * time.Second
+		// The asynchronous budget needs the same headroom, and then some: it is
+		// larger than the synchronous one in production for the same reason.
+		c.sendTimeout = 120 * time.Second
 	})
 }
 

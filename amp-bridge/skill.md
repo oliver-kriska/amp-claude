@@ -111,9 +111,18 @@ Prefer the explicit form, taking `thread_id` from the `<channel>` tag of the
 event you are following up on.
 
 This runs a full turn in the Amp thread and blocks until Amp finishes (up to
-2 min), so use it when you need the answer before continuing. If no thread has
-messaged this bridge yet and you pass no `thread_id`, it fails with an
-explanation — that's expected, not a bug.
+2 min), so use it when you need the answer before continuing. That budget is
+deliberately short: your session is holding a turn open, and that turn may
+itself be answering an Amp request with its own deadline. `send_amp` waits far
+longer (10 min) because it blocks nobody — prefer it whenever Amp's answer is
+not needed inside this turn. If no thread has messaged this bridge yet and you
+pass no `thread_id`, it fails with an explanation — that's expected, not a bug.
+
+**A timeout is not proof that nothing arrived.** When the message reached the
+thread and Amp is still working, the error says so explicitly and tells you not
+to resend; resending duplicates it. Read the wording before deciding: "safe to
+retry" means nothing was appended, "do not resend" means it is already there,
+and "check the thread" means the bridge could not tell.
 
 **Tell Amp not to call `amp-bridge --ask` in the turn you triggered.** While
 `ask_amp` is in flight your session is inside a tool call and cannot take a turn
@@ -180,7 +189,11 @@ calling it.** Amp's eventual success or failure arrives as a new event:
 ```
 
 Do not call `reply` for a completion event — no sender is waiting on a
-`request_id`. There is no polling or cancellation tool. Outstanding work is
+`request_id`. Read its `status` before reacting: `done` carries Amp's answer,
+`error` means the turn itself failed, `not-delivered` means nothing was appended
+and resending is safe, `pending` means it IS in the thread and Amp is still
+working — never resend that one — and `unknown` means the bridge could not tell,
+so check the thread first. There is no polling or cancellation tool. Outstanding work is
 bounded and in memory; if this MCP server restarts before completion, the event
 is lost even if Amp finishes the work. Use `ask_amp` instead when your next step
 depends on the answer.
@@ -226,7 +239,9 @@ nothing is delivered. `amp-bridge init` repairs that one.
 | `ask_amp`: `already has requests queued` | That thread's inbox is enabled but Amp has not finished earlier turns. Wait; don't retry straight away. |
 | `ask_amp`: `was disabled or the plugin reloaded while the request was in flight` | Delivery is genuinely unknown. Say so, and have the thread checked before anything is resent. |
 | `ask_amp`: `did not start a turn for it` | Your question IS queued in the thread. Do not resend — that duplicates it. Ask your user to continue in that thread; the next activity may pick it up. |
-| `send_amp`: `too many send_amp requests in flight` | The background cap is full. Wait for a completion event before starting another. |
+| `send_amp`: `too many send_amp requests in flight` | The background cap is full. Wait for a completion event before starting another. Slots are held for the length of Amp's turn, so a long review holds one for minutes. |
+| `<channel async_id=… status="pending">` | Delivered; Amp is still working. Not a failure and not resendable — read the thread for the outcome. |
+| `<channel async_id=… status="unknown">` | The bridge lost track before the turn ended. Check the thread before deciding anything. |
 | `another CLI fallback turn … is already in flight` | That idle thread is already running a bridge-started turn. Wait for it, or enable the inbox if queued turns are required. |
 | `<channel async_id=… status="error">` | The background request was accepted but its Amp turn failed. Read the event; do not call `reply`. |
 | A `send_amp` handle never produces a completion after the MCP server restarted | Handles and completion delivery are in memory only. Inspect the target Amp thread; do not assume the work was never appended. |

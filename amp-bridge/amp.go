@@ -78,7 +78,9 @@ func (b *bridge) askAmp(threadID, text string) (string, error) {
 	// naming the thread once. Without this, only the Amp side could establish
 	// the pair and Claude had to repeat the id on every call.
 	b.rememberThread(threadID)
-	return b.deliverToAmp(threadID, text, true)
+	// The synchronous budget: this call is holding a Claude turn open, and that
+	// turn may itself be answering an Amp request with its own deadline.
+	return b.deliverToAmp(threadID, text, true, b.cfg.ampTimeout)
 }
 
 // askAmpExplicit runs one turn without changing the bridge's remembered pair.
@@ -97,7 +99,9 @@ func (b *bridge) askAmpExplicit(threadID, text string) (string, error) {
 	if strings.TrimSpace(text) == "" {
 		return "", errEmptyText
 	}
-	return b.deliverToAmp(threadID, text, false)
+	// The asynchronous budget. Nothing is blocked on this call, so bounding it
+	// by the synchronous deadline only threw away turns Amp was still running.
+	return b.deliverToAmp(threadID, text, false, b.cfg.sendTimeout)
 }
 
 // deliverToAmp chooses the live plugin inbox when one serves the thread and
@@ -105,11 +109,13 @@ func (b *bridge) askAmpExplicit(threadID, text string) (string, error) {
 // Synchronous calls serialize the CLI fallback; background calls are already
 // bounded by asyncSlots and must not sit ahead of an ask_amp whose caller has a
 // shorter end-to-end deadline.
-func (b *bridge) deliverToAmp(threadID, text string, serializeCLI bool) (string, error) {
+func (b *bridge) deliverToAmp(
+	threadID, text string, serializeCLI bool, budget time.Duration,
+) (string, error) {
 	// Logged here, not at the call site: by this point an empty request has been
 	// resolved through knownThread(), and a log line reading thread="" cannot be
 	// classified after the fact.
-	b.logf("ASK_AMP thread=%s bytes=%d", threadID, len(text))
+	b.logf("ASK_AMP thread=%s bytes=%d budget=%s", threadID, len(text), budget)
 
 	// A thread open in an interactive Amp session cannot be reached by `threads
 	// continue`: Amp allows one executor per thread and that session holds it.
@@ -127,7 +133,7 @@ func (b *bridge) deliverToAmp(threadID, text string, serializeCLI bool) (string,
 		// EXECUTOR_ALREADY_CONNECTED anyway, since a thread with a live inbox is
 		// by construction open, and once the ask frame is written the message may
 		// already be appended. A loud error beats a possible double delivery.
-		return b.askViaInbox(entry, threadID, text)
+		return b.askViaInbox(entry, threadID, text, budget)
 	}
 
 	if serializeCLI {
@@ -138,7 +144,7 @@ func (b *bridge) deliverToAmp(threadID, text string, serializeCLI bool) (string,
 		defer b.askMu.Unlock()
 	}
 	if !b.beginCLIThread(threadID) {
-		return "", fmt.Errorf(
+		return "", deliveryFault(deliveryNotSent,
 			"another CLI fallback turn for thread %s is already in flight in this bridge; "+
 				"wait for it to finish or enable the thread inbox to queue turns", threadID,
 		)
@@ -147,7 +153,7 @@ func (b *bridge) deliverToAmp(threadID, text string, serializeCLI bool) (string,
 
 	// Derived from the bridge context, not Background: on shutdown the Amp
 	// subprocess must die with us rather than linger as an orphan.
-	ctx, cancel := context.WithTimeout(b.ctx, b.cfg.ampTimeout)
+	ctx, cancel := context.WithTimeout(b.ctx, budget)
 	defer cancel()
 
 	// Give amp a log file of our own. Its stderr on failure is famously unhelpful
@@ -177,7 +183,11 @@ func (b *bridge) deliverToAmp(threadID, text string, serializeCLI bool) (string,
 	out, errOut, err := runAmp(ctx, b.cfg.ampBin, args)
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return out, fmt.Errorf("amp timed out after %s", b.cfg.ampTimeout)
+		// The CLI path owns the thread outright, so a deadline here leaves a turn
+		// running under our own subprocess: delivered, outcome unseen.
+		return out, deliveryFault(deliveryUnknown,
+			"amp timed out after %s — the turn may have run in thread %s; check it before "+
+				"resending", budget, threadID)
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return out, errors.New("bridge is shutting down; the Amp turn was cancelled")

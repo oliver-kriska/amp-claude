@@ -75,11 +75,13 @@ the inbox appended the request, but Amp exposes no plugin wake primitive.
 | Message size | 64 KB | `message too large` — send a summary or a file path instead |
 | Reply timeout | 180 s (15 min max) | timeout returns an id; retrieve a late reply with `--result` |
 | Retained late replies | 1 h / 64 | expiry or bridge restart removes the in-memory result |
-| Amp turn timeout | 120 s | `ask_amp` fails or `send_amp` reports an error completion |
+| ask_amp turn timeout | 120 s | `ask_amp` fails; the message may still be in the thread |
+| send_amp turn timeout | 10 min | completion arrives as `pending`, not `error`, when it was delivered |
 
 All are env-tunable (`AMP_BRIDGE_MAX_INFLIGHT`, `AMP_BRIDGE_MAX_BYTES`,
 `AMP_BRIDGE_TIMEOUT`, `AMP_BRIDGE_MAX_TIMEOUT`, `AMP_BRIDGE_RESULT_TTL`,
-`AMP_BRIDGE_MAX_RESULTS`, `AMP_BRIDGE_AMP_TIMEOUT`) but the defaults exist to stop a
+`AMP_BRIDGE_MAX_RESULTS`, `AMP_BRIDGE_AMP_TIMEOUT`, `AMP_BRIDGE_SEND_TIMEOUT`)
+but the defaults exist to stop a
 runaway loop from flooding someone's session. Raise them deliberately, not
 reflexively; `doctor` warns if the Amp timeout leaves 30 s or less before the
 Claude reply deadline.

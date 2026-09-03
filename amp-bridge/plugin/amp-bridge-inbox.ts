@@ -684,7 +684,12 @@ export default function (amp: PluginAPI) {
     }
     const where = req.appended ? 'the Amp turn did not finish in time' : 'queued behind another bridge request'
     log(`TIMEOUT req=${req.id} thread=${req.threadID} appended=${req.appended}`)
-    respond(req, { error: `${where}${detail}`, code: 'timeout' })
+    // `delivered` is the same fact as `appended`, but stated where the bridge
+    // can read it. Both cases share code 'timeout' and want opposite responses
+    // — resend freely versus never resend — so leaving the distinction in prose
+    // meant the caller had to guess, and a wrong guess duplicates a message.
+    // A field rather than a new code, so an older bridge simply ignores it.
+    respond(req, { error: `${where}${detail}`, code: 'timeout', delivered: req.appended })
 
     // If we never appended, nothing owns a turn and the lane can move on. If we
     // did, the turn is still running: agent.end or the orphan timer releases it.

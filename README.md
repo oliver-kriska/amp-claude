@@ -831,6 +831,15 @@ allowlist. Note also that the bypass is per entry — combining both flags does 
 extend it to the `--channels` entries. So the warning is expected here, not a sign
 of misconfiguration.
 
+
+**A send_amp timeout does not mean the message was lost.** `ask_amp` is bounded
+at 2 minutes because it holds a Claude turn open; `send_amp` waits 10 minutes
+because it blocks nobody. When a send does time out, the completion event says
+which kind of timeout it was: `pending` means the message reached the thread and
+Amp is still working — resending duplicates it — while `not-delivered` means
+nothing was appended and a retry is safe. `unknown` means the bridge could not
+tell, so check the thread. Set `AMP_BRIDGE_SEND_TIMEOUT` to change the send
+budget; `amp-bridge doctor` reports it under `send budget`.
 **Can the two agents work in parallel?** Yes when the target Amp thread is free
 for CLI fallback: tell Claude to use `send_amp`, then end its current turn. Amp
 works in the background and a completion event wakes Claude with the result. An
